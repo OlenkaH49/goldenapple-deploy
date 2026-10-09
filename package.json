@@ -7,9 +7,45 @@
     "start": "node server.js",
     "dev": "node server.js",
     "install:deps": "npm install",
+    "postinstall": "node download-dict.js",
+
+    "sync": "node sync_to_knowledge.js",
+    "export": "node export_csv.js",
+    "kb:guide": "node sync_to_knowledge.js",
+    "kb:export": "node sync_to_knowledge.js --export",
+    "kb:stats": "node sync_to_knowledge.js --stats",
+    "kb:mark-synced": "node sync_to_knowledge.js --mark-synced",
+    "kb:verify": "node sync_to_knowledge.js --verify",
+
+    "dict:import": "node import_ecdict.js",
+    "dict:import:core": "node import_ecdict.js --profile=core",
+    "dict:import:all": "node import_ecdict.js --profile=all",
+    "dict:probe": "node import_ecdict.js --probe",
+    "dict:download": "node download-dict.js",
+    "dict:download:force": "node download-dict.js --force",
+
+    "test:card": "node test_word_card.js",
+    "test:card:browser": "node test_word_card_browser.js",
+    "test:guess": "node test_guess_lock.js",
+    "test:missing": "node test_sentence_missing.js",
+    "test:empty": "node test_sentence_empty_guard.js",
+    "test:quiz": "node test_quiz_empty_guard.js",
+    "test:api": "node test_api_layers.js",
+    "test:cleanup": "node test_article_cleanup.js",
+    "test:backfill": "node test_backfill_and_partial.js",
+    "test:retry": "node test_sentence_retry.js",
+    "test:match": "node test_sentence_match_split.js",
+    "test:quick": "node test_quick_actions.js",
+    "test:nav": "node test_navigation.js",
+    "cleanup:articles": "node cleanup_articles.js",
+    "cleanup:articles:apply": "node cleanup_articles.js --apply",
+    "backfill:userwords": "node backfill_user_word_definitions.js",
+    "backfill:userwords:apply": "node backfill_user_word_definitions.js --apply",
+    "audit:context": "node audit_word_context.js",
+    "probe:kb": "node probe_kb_coverage.js",
+
     "docker:up": "docker compose up -d",
-    "docker:down": "docker compose down",
-    "postinstall": "node -e \"require('fs').rmSync('node_modules/better-sqlite3/prebuilds',{recursive:true,force:true})\" && npm rebuild better-sqlite3 --build-from-source"
+    "docker:down": "docker compose down"
   },
   "keywords": [
     "english",
@@ -24,9 +60,10 @@
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
+    "node-cron": "^4.6.0",
     "node-fetch": "^2.7.0"
   },
   "engines": {
-    "node": "18.x"
+    "node": "24.x"
   }
 }

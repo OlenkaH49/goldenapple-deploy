@@ -4,18 +4,30 @@
  * 架构：
  *   db.js       → SQLite 数据库（替代 PostgreSQL，零安装）
  *   coze.js     → Coze API 调用纯函数（同步接口 + 异步队列复用）
+ *                 另有：Coze 知识库【检索】接入（L1 = 调 word_context_search 工作流）+ 三层查词
+ *                 2026-09-28：L1 从「直连知识库 HTTP 接口」改为「调工作流 /v1/workflow/run」
  *   queue.js    → 进程内轻量异步队列（替代 Bull+Redis，含重试退避）
  *   fallback.js → AI 失败时的降级题目生成器
+ *   export_csv.js → 手动导出 word_context.csv（手动同步第 ① 步）
+ *   sync_to_knowledge.js → 手动同步辅助：导出 / 统计 / 标记已同步 / 只读对账
+ *                  （2026-09-28 起知识库改为手动同步，代码内的定时上传已停用）
  *
  * 接口总览：
  *   GET  /                          首页
- *   GET  /health                    健康检查
- *   GET  /api/articles              列出所有文章（从 DB）
- *   GET  /api/article/:id           获取单篇文章
+ *   GET  /health                    健康检查（含知识库配置状态）
+ *   GET  /api/articles              文章列表（分页 ?page=&pageSize=&status=&withContent=，
+ *                                   2026-10-06 起返回 {items,page,total,hasMore} 而非裸数组）
+ *   GET  /api/article/:id           获取单篇文章（含正文/译文/释义/题目，列表页按需调用）
  *   GET  /api/article-status/:id    查询文章处理状态（异步轮询用）
  *   POST /api/upload-article         异步上传文章（入队，立即返回 pending）
  *   POST /api/analyze                SSE 同步分析（保留兼容旧前端）
  *   POST /api/word-meaning          查词（word_cache 表）
+ *   GET  /api/words/:word           查词（本地词典层 + 语境释义；?ai=1 才走 AI）
+ *   GET  /api/dictionary/:word      查词典层原始词条（不涉及语境）
+ *   GET  /api/glue-word/:word       拆粘连词（rapiddevelopment → rapid + development；?ai=1 才允许 AI 兜底）
+ *   POST /api/dictionary/batch      批量查词典（前端进阅读页时一次性预取本文所有词）
+ *   GET  /api/dictionary/stats      词典库状态（词条数 / 体积 / 是否就绪）
+ *   GET  /api/kb/stats              知识库配置 + 各层命中率（排查用）
  *   GET  /api/user-words            获取用户收藏单词（按 status 筛选）
  *   POST /api/collect-word          拖拽收藏（存入 user_words 表）
  *   PUT  /api/word-status/:id        更新单词分类状态
@@ -35,11 +47,48 @@ const queue = require('./queue');
 const { generateFallbackQuestions } = require('./fallback');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+
+// ---- 端口（2026-10-09 部署改造）----
+// Render / Railway 等平台**动态分配**端口，只通过环境变量 PORT 告知应用；
+// 写死 3000 会导致服务起来但平台探活失败（No open ports detected）。
+// Number() 兜一层：PORT 被配成非数字（如 'abc'）时不要传出 NaN → 回落到 3000。
+// 注意 0 也会回落到 3000（0 在 Node 里 = 随机端口，不是我们想要的语义）。
+const PORT = Number(process.env.PORT) || 3000;
+const PORT_FROM_ENV = !!(process.env.PORT && String(process.env.PORT).trim());
+// listen 不指定 host → 默认监听所有网卡（0.0.0.0/::），正是容器平台需要的，不要改成 127.0.0.1。
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// ==================== 静态资源防护（2026-10-09 部署加固）====================
+// 原来 `express.static(__dirname)` 把**整个项目根目录**暴露到公网，实测：
+//   GET /data/app.db  → 200，直接下载整个用户数据库（用户 / 收藏 / 文章）
+//   GET /coze.js      → 200，后端源码
+//   GET /.env         → 404 ✅（express.static 默认忽略 dotfiles，这条本来就安全）
+// 这里在静态中间件**之前**拦掉「绝不该被浏览器直接取」的路径。
+// ⚠️ 不能一刀切禁 `.js` —— `/app.js` 就是前端主脚本，必须放行；所以用精确黑名单。
+const BLOCKED_STATIC_PREFIXES = ['/data', '/node_modules', '/.git'];
+function isBlockedStaticPath(rawPath) {
+    const pathname = String(rawPath || '/').split('?')[0].split('#')[0];
+    if (BLOCKED_STATIC_PREFIXES.some(p => pathname === p || pathname.startsWith(p + '/'))) return true;
+    // SQLite 数据库文件与备份（app.db / app.db-wal / app.db-shm / app.db.bak-2026-...）
+    if (/\.(db|sqlite|sqlite3)(-wal|-shm)?$/i.test(pathname)) return true;
+    if (/\.bak-[0-9A-Za-z:.\-]+$/i.test(pathname)) return true;
+    // 后端源码 / 工程文件 / 测试脚本（前端只依赖 index.html、app.js 与根目录 *.svg）
+    if (/^\/(server|db|coze|queue|fallback|seed|export_csv|sync_to_knowledge|import_ecdict|download-dict)\.js$/i.test(pathname)) return true;
+    if (/^\/(package(-lock)?\.json|docker-compose\.ya?ml|\.gitignore)$/i.test(pathname)) return true;
+    if (/^\/test_[\w.-]*\.js$/i.test(pathname)) return true;
+    return false;
+}
+app.use(function (req, res, next) {
+    if (isBlockedStaticPath(req.path)) {
+        console.warn(`🛡️ [静态防护] 拦截静态请求: ${req.method} ${req.originalUrl}`);
+        return res.status(404).type('text/plain').send('Not Found');
+    }
+    next();
+});
+
 app.use(express.static(path.join(__dirname)));
 
 // ==================== 访问密码鉴权 ====================
@@ -91,10 +140,39 @@ app.get('/health', (req, res) => {
         status: 'ok',
         cozeConfigured: coze.isCozeConfigured(),
         cozeBotId: coze.config.COZE_BOT_ID || '未配置',
+        // L1 检索是否就绪（2026-09-28 起 = word_context_search 工作流是否配置）
+        knowledgeBaseConfigured: coze.isKnowledgeBaseConfigured(),
+        knowledgeBaseId: coze.config.COZE_KB_ID || '未配置',
+        searchWorkflowId: coze.config.COZE_KB_SEARCH_WORKFLOW_ID || '未配置',
+        searchWorkflowPath: coze.config.COZE_KB_WORKFLOW_PATH,
+        searchQueryMode: coze.config.COZE_KB_QUERY_MODE,
+        // L1 熔断状态：open=true 表示 L1 因额度/权限/未发布被暂时跳过（点词走 L2/L3）
+        kbCircuit: coze.getKbCircuitState(),
+        // 模型健康：GLM / DeepSeek 谁在冷却中（连续超时会自动熔断，改用另一个）
+        modelHealth: typeof coze.getModelHealth === 'function' ? coze.getModelHealth() : null,
+        // 词典层：本地 ECDICT 词典库是否就绪（ready=false 时点词只有语境释义）
+        dictionary: dbOps.getDictionaryStats(),
         port: PORT,
-        database: 'SQLite',
+        portFromEnv: PORT_FROM_ENV,
+        // 实际使用的数据库路径（部署后在 /health 里一眼确认 Volume 有没有生效）
+        dbPath: dbOps.DB_PATH,
+        dbPathSource: dbOps.DB_PATH_SOURCE,
+        dictPath: dbOps.DICT_PATH,
+        database: 'SQLite（app.db 用户数据 + dictionary.db 词典，两个独立文件）',
         queue: '进程内轻量队列'
     });
+});
+
+// 手动复位 L1 熔断（修好 Coze 额度/权限/工作流发布后，不必等冷却，直接调一次即可恢复）
+app.get('/api/kb/reset-circuit', (req, res) => {
+    const before = coze.resetKbCircuit();
+    res.json({ ok: true, before, after: coze.getKbCircuitState() });
+});
+
+// 手动复位模型熔断（某个模型误判冷却时用）
+app.get('/api/model/reset-health', (req, res) => {
+    const before = typeof coze.resetModelHealth === 'function' ? coze.resetModelHealth() : null;
+    res.json({ ok: true, before, after: typeof coze.getModelHealth === 'function' ? coze.getModelHealth() : null });
 });
 
 // 校验访问密码：正确返回 200，错误由 requireAccessPassword 中间件返回 401（前端弹窗用）
@@ -105,19 +183,65 @@ app.get('/api/verify-password', (req, res) => {
 // ==================== 文章相关接口 ====================
 
 // 列出所有文章（从数据库）
+/**
+ * 文章列表 —— 分页版（2026-10-06 改造）。
+ *
+ * 契约变化：原来返回**裸数组**（全量 73 篇一次性给），现在返回
+ *   { page, pageSize, total, totalPages, hasMore, items }
+ * items 只带「列表真要用的字段」（title/description/content/source/created_at + 计数），
+ * **不带 sentences / words / questions** —— 那三样体积最大，改由 /api/article/:id 按需提供。
+ *
+ * 为什么这么做：前端原来把 6 篇预置文章硬编码在 app.js 里，用户上传的文章刷新就没了。
+ * 改成走服务端后，必须顺手解决「一次拉全量」的存储/带宽压力：分页 + 按需详情。
+ *
+ * 排序见 dbOps.listArticlesPaged（预置优先 + created_at DESC + id DESC）。
+ */
 app.get('/api/articles', (req, res) => {
-    const articles = dbOps.listArticles().map(a => ({
-        id: a.id,
-        title: a.title,
-        description: a.description,
-        level: a.level,
-        levelLabel: a.level_label,
-        source: a.source,
-        status: a.status,
-        wordCount: a.word_count,
-        questionCount: (a.questions || []).length
-    }));
-    res.json(articles);
+    const page = parseInt(req.query.page, 10) || 1;
+    const pageSize = parseInt(req.query.pageSize, 10) || 10;
+    const status = req.query.status || 'all';
+    const withContent = req.query.withContent !== '0';   // 默认带正文：点开要能立刻渲染，不用等详情
+
+    const paged = dbOps.listArticlesPaged({ page, pageSize, status });
+
+    const items = paged.rows.map(a => {
+        let questionCount = 0;
+        try { questionCount = a.questions ? JSON.parse(a.questions).length : 0; } catch (e) { questionCount = 0; }
+        const item = {
+            id: a.id,
+            title: a.title,
+            description: a.description,
+            level: a.level,
+            levelLabel: a.level_label,
+            source: a.source,
+            status: a.status,
+            wordCount: a.word_count,
+            questionCount: questionCount,
+            // '[]' 的字符长度正好是 2 → 大于 2 才算真的存了译文。前端据此决定要不要顺手拉详情。
+            hasSentences: (a.sentences_length || 0) > 2,
+            // 'partial' = 句子翻译失败（单词/题目成功），列表里可以标一个「译文缺失」角标
+            sentencesError: a.sentences_error || null,
+            createdAt: a.created_at
+        };
+        if (withContent) item.content = a.content || '';
+        return item;
+    });
+
+    const withTrans = items.filter(i => i.hasSentences).length;
+    const partialCount = items.filter(i => i.status === 'partial').length;
+    console.log(`📚 [articles] 分页请求 page=${page} pageSize=${pageSize} status=${status} withContent=${withContent}`
+        + ` → 返回第 ${paged.page}/${paged.totalPages} 页 | 本页 ${items.length} 篇 | 共 ${paged.total} 篇`
+        + ` | 本页已有译文 ${withTrans} 篇（其余前端走本地切句兜底）`
+        + (partialCount ? ` | 其中 ${partialCount} 篇为 partial（句子翻译失败）` : ''));
+
+    res.json({
+        page: paged.page,
+        pageSize: paged.pageSize,
+        total: paged.total,
+        totalPages: paged.totalPages,
+        hasMore: paged.page < paged.totalPages,
+        items: items
+    });
 });
 
 // 获取单篇文章（含 content/words/questions）
@@ -142,7 +266,10 @@ app.get('/api/article/:id', (req, res) => {
         sentences: article.sentences || [],
         questions: article.questions || [],
         status: article.status,
-        source: article.source
+        source: article.source,
+        // status='partial' 时非空：句子翻译失败原因。前端阅读页据此提示「译文生成失败」。
+        sentencesError: article.sentences_error || null,
+        hasSentences: (article.sentences || []).length > 0
     });
 });
 
@@ -152,6 +279,10 @@ app.get('/api/article-status/:id', (req, res) => {
     if (!article) {
         return res.status(404).json({ error: '文章不存在', status: 'not_found' });
     }
+
+    // 诊断日志：每次轮询打印 DB 状态 vs 队列状态，便于排查「队列完成但前端仍在轮询」
+    const _qStatus = queue.getQueueStatus(req.params.id);
+    console.log(`📡 [article-status] id=${req.params.id} | DB状态=${article.status} | 队列状态=${_qStatus ? _qStatus.status : '无队列记录'} | 重试=${_qStatus ? _qStatus.retries : 0}`);
 
     // 已完成：返回文章内容 + questions
     if (article.status === 'completed') {
@@ -165,9 +296,52 @@ app.get('/api/article-status/:id', (req, res) => {
             level: article.level,
             levelLabel: article.level_label,
             words: wordMeanings,
+        sentences: article.sentences || [],
+        questions: article.questions || [],
+        isFallback: false,
+        // 句子翻译失败原因（历史数据都是 null；只有「部分完成」的文章才有值）
+        sentencesError: article.sentences_error || null,
+        // ★ 必须取真实值，不能写死 false（2026-10-08）：
+        //   「重试译文」对**存量文章**（status='completed' 但 sentences=[]，早期静默降级留下的一批）
+        //   同样允许重跑，而重跑期间 DB 的 status 一直是 completed、sentences 也一直是 []。
+        //   前端轮询就是靠这个字段区分「还在跑」和「跑完了但仍然是空」——
+        //   写死 false 会让前端把「正在重试」误判成「非预期状态」并立刻停止等待，
+        //   表现为「点了重试什么都不发生」。
+        sentencesRetrying: queue.isRetryingSentences(req.params.id)
+    });
+    }
+
+    // 部分完成（2026-10-06 新增）：单词释义 / 阅读理解题成功，但**句子翻译失败**。
+    //
+    // 这个分支必须存在，不能只改 queue.js：
+    //   若落到下面的 pending/processing 分支，前端会以为任务还在跑、一路轮询到 5 分钟超时才罢休，
+    //   而且永远等不到「进入阅读页」——把静默降级换成了更糟的「卡住」，是明确的回归。
+    // 语义上接近 completed（题目/释义都是真结果），所以带上 isFallback=false + 一个 partial 标记，
+    // 前端按「可阅读，但译文缺失」提示。
+    if (article.status === 'partial') {
+        const allWords = coze.extractWords(article.content || '');
+        const wordMeanings = dbOps.getWordMeaningFromCache(allWords);
+        const why = article.sentences_error || '句子翻译工作流失败';
+        // 是否正在「只重跑句子翻译」（2026-10-07）：前端点「重试」后靠这个字段区分
+        // 「还在跑，继续等」和「又失败了，别再等了」——两者 DB status 都是 partial。
+        const retrying = queue.isRetryingSentences(req.params.id);
+        console.warn(`⚠️ [article-status] id=${req.params.id} 状态=partial（句子翻译失败，译文缺失）| 原因: ${why}`
+            + (retrying ? ' | 🔁 译文重试进行中' : ''));
+        return res.json({
+            status: 'partial',
+            articleId: article.id,
+            title: article.title,
+            content: article.content,
+            level: article.level,
+            levelLabel: article.level_label,
+            words: wordMeanings,
             sentences: article.sentences || [],
             questions: article.questions || [],
-            isFallback: false
+            isFallback: false,
+            partial: true,
+            sentencesFailed: true,
+            sentencesRetrying: retrying,
+            sentencesError: why
         });
     }
 
@@ -185,19 +359,36 @@ app.get('/api/article-status/:id', (req, res) => {
             level: article.level,
             levelLabel: article.level_label,
             words: wordMeanings,
+            sentences: article.sentences || [],
             questions: fallbackQuestions,
             isFallback: true,
             error: queueStatus ? queueStatus.error : 'AI 分析失败，已使用降级题目'
         });
     }
 
-    // pending 或 processing：返回 processing（前端继续轮询）
+    // pending 或 processing：返回 processing + 已就绪的部分结果（谁先完成谁先返回给前端）
     const queueStatus = queue.getQueueStatus(article.id);
     return res.json({
         status: 'processing',
         articleId: article.id,
+        title: article.title,
+        content: article.content,
+        level: article.level,
+        levelLabel: article.level_label,
         queueStatus: queueStatus ? queueStatus.status : article.status,
-        retries: queueStatus ? queueStatus.retries : 0
+        retries: queueStatus ? queueStatus.retries : 0,
+        // 单词释义工作流部分结果（单词 + 释义 + sentenceIndex）
+        words: queueStatus ? (queueStatus.words || null) : null,
+        wordsReady: queueStatus ? !!queueStatus.wordsReady : false,
+        // 句子翻译工作流部分结果（句子 + 翻译）
+        sentences: queueStatus ? (queueStatus.sentences || null) : null,
+        sentencesReady: queueStatus ? !!queueStatus.sentencesReady : false,
+        // 句子翻译在工作流里就已经挂了（还未落库）→ 轮询期间即可提前告知前端
+        sentencesFailed: queueStatus ? !!queueStatus.sentencesFailed : false,
+        sentencesError: queueStatus ? (queueStatus.sentencesError || null) : null,
+        // 题目工作流部分结果（quiz_generator）
+        questions: queueStatus ? (queueStatus.questions || null) : null,
+        questionsReady: queueStatus ? !!queueStatus.questionsReady : false
     });
 });
 
@@ -223,6 +414,74 @@ app.post('/api/article-fallback/:id', (req, res) => {
         sentences: article.sentences || [],
         questions: fallbackQuestions,
         isFallback: true
+    });
+});
+
+// ==================== 只重跑「句子翻译」（2026-10-07 新增）====================
+//
+// 前端阅读页在 status='partial' 时显示「⚠️ 句子翻译暂时不可用 [重试]」，点按钮调这里。
+//
+// 契约：**立即返回 202**，后台异步跑，前端轮询 /api/article-status/:id 拿结果。
+// 为什么不做成同步等结果：句子翻译工作流单次可能几十秒（长文章 timeout 更久），
+// 一个挂着几十秒的 HTTP 请求既容易被中间层掐断，用户也只会看到按钮转圈。
+//
+// 只重跑句子翻译、不重跑整篇 —— 详见 queue.startSentenceRetry 的注释（省额度 + 不覆盖已有好结果）。
+app.post('/api/retry-sentences/:id', (req, res) => {
+    const articleId = req.params.id;
+    const article = dbOps.getArticleById(articleId);
+    if (!article) {
+        console.warn(`⚠️ [重试译文] 文章不存在: ${articleId}`);
+        return res.status(404).json({ ok: false, error: '文章不存在' });
+    }
+
+    const existingSentences = Array.isArray(article.sentences) ? article.sentences : [];
+
+    // 幂等：已经有译文且状态不是 partial → 不重复调 Coze（省额度），直接告诉前端「已经好了」
+    if (article.status === 'completed' && existingSentences.length > 0) {
+        console.log(`⏭️ [重试译文] ${articleId} 已是 completed 且有 ${existingSentences.length} 句译文 → 直接返回，不重复调用`);
+        return res.json({
+            ok: true,
+            alreadyDone: true,
+            articleId,
+            status: 'completed',
+            sentences: existingSentences,
+            sentencesError: null,
+            message: '该文章译文已存在，无需重试'
+        });
+    }
+
+    // 整篇分析还在跑（pending / processing）→ 让它自己落库，别并发插一脚
+    if (article.status === 'pending' || article.status === 'processing') {
+        console.warn(`⏭️ [重试译文] ${articleId} 仍在整篇分析中（status=${article.status}）→ 拒绝重试`);
+        return res.status(409).json({
+            ok: false,
+            articleId,
+            status: article.status,
+            error: '文章仍在分析中，请等待分析结束后再重试译文'
+        });
+    }
+
+    const r = queue.startSentenceRetry(articleId);
+    if (!r.started) {
+        // 已经在重试了 → 幂等返回 202，前端继续轮询即可
+        console.log(`⏭️ [重试译文] ${articleId} 已有重试在跑（${r.reason}）→ 返回 202，前端继续轮询`);
+        return res.status(202).json({
+            ok: true,
+            articleId,
+            status: 'retrying',
+            alreadyRunning: true,
+            message: '译文重试已在进行中'
+        });
+    }
+
+    console.log(`🔁 [重试译文] 已启动 | articleId=${articleId} | 当前状态=${article.status}`
+        + ` | 已有译文 ${existingSentences.length} 句 | 失败原因="${article.sentences_error || '（无）'}"`);
+
+    res.status(202).json({
+        ok: true,
+        articleId,
+        status: 'retrying',
+        message: '已开始重新生成句子翻译，请稍候'
     });
 });
 
@@ -414,32 +673,232 @@ app.post('/api/word-meaning', (req, res) => {
     res.json({ word: word.toLowerCase(), meaning: null, found: false });
 });
 
-// 获取某单词的释义（语境库 → 通用词库；语境释义来自文章分析的 sentenceIndex 关联）
-app.get('/api/words/:word', (req, res) => {
+// 获取某单词的释义
+//   词典层：本地 ECDICT 词典库（同步、无网络）→ 返回该词的「所有释义」+ 音标/词性/星级/考试标签
+//   语境释义：① Coze 知识库 → ② word_context 语境库 → ③ AI 生成并回写（默认关闭，见下）
+// 响应同时给两栏：contextDefinition（语境释义，可能为 null）+ dictionary（完整释义）
+// 参数：?context=当前句子（建议传，否则没有语境释义）、&ai=1（开启第三层 AI，按需）
+//
+// 为什么 AI 改成「默认关闭、显式开启」：
+//   词典层已经能给出完整释义，而 L3 走 LLM 实测往返 4~13 秒。默认开着等于每次点冷词
+//   都拖一个十几秒的长请求。前端改成先即时出卡（词典 + 已有语境库），卡片里放
+//   「AI 生成语境释义」按钮，用户真要看「这句话里什么意思」时带 ?ai=1 再打一次。
+app.get('/api/words/:word', async (req, res) => {
     const word = (req.params.word || '').trim();
     if (!word) return res.status(400).json({ error: '缺少 word 参数' });
 
     const context = (req.query.context || '').trim();
-    const lower = word.toLowerCase();
+    // 联网深查开关：?ai=1 或 ?remote=1 才走网络（L1 知识库工作流 + L3 AI 生成）。
+    // 不传 = 只查本地（词典 + 语境库），响应稳定在几毫秒。
+    const enableRemote = req.query.ai === '1' || req.query.ai === 'true'
+        || req.query.remote === '1' || req.query.remote === 'true';
 
-    // 第一层：语境库（word + 当前句子精确命中，释义来自文章分析时的 sentenceIndex 关联）
-    if (context) {
-        const ctx = dbOps.getWordContext(lower, context);
-        if (ctx) {
-            return res.json({
-                success: true, word: lower, context: context, source: 'context',
-                definitions: [{ definition: ctx.definition, part_of_speech: ctx.part_of_speech }]
-            });
+    try {
+        const r = await coze.lookupWordWithLayers(word, context, {
+            enableRemote,
+            articleId: req.query.articleId || null
+        });
+        return res.json({
+            success: true,
+            word: r.word,
+            context: context,
+            // —— 语境释义（本句里的意思）——
+            contextDefinition: r.contextDefinition || null,
+            contextSource: r.contextSource || null,   // kb | context | ai | cache | null
+            // —— 完整释义（词典层）——
+            dictionary: r.dictionary || null,
+            // —— 兼容旧前端 ——
+            source: r.source,           // dictionary | context | ai | cache | none
+            layer: r.layer,             // 主释义来源：dictionary | kb | context | ai | cache | none
+            hitScore: r.hitScore,
+            elapsedMs: r.elapsed,
+            dictElapsedMs: r.dictElapsedMs,
+            definitions: r.definition
+                ? [{ definition: r.definition, part_of_speech: r.partOfSpeech || null }]
+                : []
+        });
+    } catch (e) {
+        console.error(`❌ [words] 查词异常 | word=${word} | ${e.message}`);
+        // 兜底：退回「词典层 → 语境库 → 通用词库」，保证接口始终可用
+        const lower = word.toLowerCase();
+        const dictEntry = dbOps.getDictionaryEntry(lower);
+        if (context) {
+            const ctxRow = dbOps.getWordContext(lower, context);
+            if (ctxRow) {
+                return res.json({
+                    success: true, word: lower, context: context, source: 'context', layer: 'context',
+                    contextDefinition: ctxRow.definition, contextSource: 'context',
+                    dictionary: dictEntry,
+                    definitions: [{ definition: ctxRow.definition, part_of_speech: ctxRow.part_of_speech }],
+                    fallback: true
+                });
+            }
         }
+        const definitions = dbOps.getWordDefinitions(lower);
+        return res.json({
+            success: true, word: lower, context: context, layer: dictEntry ? 'dictionary' : 'cache',
+            source: dictEntry ? 'dictionary' : (definitions.length > 0 ? 'cache' : 'none'),
+            contextDefinition: null, contextSource: null,
+            dictionary: dictEntry,
+            definitions: definitions,
+            fallback: true
+        });
     }
+});
 
-    // 第二层：通用词库兜底（标注「通用释义」）
-    const definitions = dbOps.getWordDefinitions(lower);
+// 知识库配置状态 + 三层查询命中率（排查「哪一层在扛」用）
+app.get('/api/kb/stats', (req, res) => {
+    // 本地计数（零 API 成本）。知识库文档数需要调接口，刻意不放在这里，避免拖慢该路由。
+    let sync = { total: 0, pending: 0, synced: 0 };
+    try {
+        sync = dbOps.getWordContextSyncStats();
+    } catch (e) {
+        console.warn(`⚠️ 读取同步统计失败: ${e.message}`);
+    }
     res.json({
-        success: true, word: lower, context: context,
-        source: definitions.length > 0 ? 'cache' : 'none',
-        definitions: definitions
+        syncMode: 'manual',                     // 知识库同步方式：手动（跑 export_csv.js + 控制台上传 CSV）
+        manualFlow: [
+            'node export_csv.js',
+            'Coze 控制台手动上传 word_context.csv（文件类型选 txt）',
+            'node sync_to_knowledge.js --mark-synced'
+        ],
+        configured: coze.isKnowledgeBaseConfigured(),
+        kbId: coze.config.COZE_KB_ID || null,
+        baseUrl: coze.config.COZE_KB_BASE_URL,
+        // L1 检索 = 调 word_context_search 工作流（POST /v1/workflow/run）
+        // 旧的直连路径 /open_api/knowledge/document/search 是网关 404，已废弃（COZE_KB_SEARCH_PATH 不再使用）
+        searchVia: 'workflow',
+        searchWorkflowId: coze.config.COZE_KB_SEARCH_WORKFLOW_ID || null,
+        searchWorkflowPath: coze.config.COZE_KB_WORKFLOW_PATH,
+        searchWorkflowQueryParam: coze.config.COZE_KB_WORKFLOW_QUERY_PARAM,
+        searchWorkflowTimeoutMs: coze.config.COZE_KB_WORKFLOW_TIMEOUT_MS,
+        sync,                                   // word_context 有效/已同步/待同步
+        lookup: coze.getLookupStats()           // 含 lookup.kbWorkflow：L1 工作流的 调用/命中/未命中/失败
     });
+});
+
+// ==================== 词典层（本地 ECDICT 词典库） ====================
+
+// 词典库状态：词条数、含音标/释义数、文件体积、是否就绪
+// 注意：这条必须定义在 /api/dictionary/:word 之前，否则 "stats" 会被当成一个单词吃掉
+app.get('/api/dictionary/stats', (req, res) => {
+    const stats = dbOps.getDictionaryStats();
+    if (!stats.ready) {
+        return res.json({
+            success: false,
+            ready: false,
+            state: stats.state,     // missing（没导入）| broken（文件坏了）
+            path: stats.path,
+            hint: '运行 npm run dict:import 导入 ECDICT 词典（约 36.5 万词条 / 58MB）'
+        });
+    }
+    res.json({ success: true, ...stats });
+});
+
+// 批量查词：给前端「进阅读页时一次性预取本文所有词」用。
+// 一次 SQL 拿完，避免每个词一次 HTTP 往返 —— 点词时前端就能 0 网络即时出卡。
+// body: { words: ["shock", "gradually", ...] }
+app.post('/api/dictionary/batch', (req, res) => {
+    const words = Array.isArray(req.body && req.body.words) ? req.body.words : null;
+    if (!words || words.length === 0) {
+        return res.status(400).json({ error: '缺少 words 数组' });
+    }
+    if (words.length > 2000) {
+        return res.status(400).json({ error: `一次最多查 2000 个词（收到 ${words.length}）` });
+    }
+    const t0 = Date.now();
+    const map = dbOps.getDictionaryEntries(words);
+    const elapsed = Date.now() - t0;
+    const hit = Object.keys(map).length;
+    console.log(`📖 [dictionary/batch] 请求 ${words.length} 个词 | 命中 ${hit} | 缺失 ${words.length - hit} | 耗时 ${elapsed}ms`);
+    res.json({
+        success: true,
+        requested: words.length,
+        hit,
+        miss: words.length - hit,
+        elapsedMs: elapsed,
+        entries: map            // { word: {phonetic, translationLines, ...} }
+    });
+});
+
+// 查单个词的词典释义（不涉及语境，纯词典层；排障与调试用）
+app.get('/api/dictionary/:word', (req, res) => {
+    const word = (req.params.word || '').trim();
+    if (!word) return res.status(400).json({ error: '缺少 word 参数' });
+    const t0 = Date.now();
+    const entry = dbOps.getDictionaryEntry(word);
+    res.json({
+        success: !!entry,
+        word: word.toLowerCase(),
+        elapsedMs: Date.now() - t0,
+        entry: entry || null,
+        hint: entry ? undefined : '本地词典未收录该词（可能是拼写变体、专有名词或缩写）'
+    });
+});
+
+// 粘连词拆分（2026-10-07）：rapiddevelopment → rapid + development
+//
+// 背景：文章正文常因 PDF/OCR 抽取丢空格，产生 rapiddevelopment / thinkprivate 这类粘连词，
+// 点上去词典必然查不到。需求：先查合并词，查不到就拆成若干真词，各自给释义。
+// 实现全在 coze.segmentGluedWord（用本地 ECDICT 当词表做动态规划分词），**默认 0 联网、0 额度**；
+// ?ai=1 时才允许退到 AI 兜底（前端只有用户主动点「AI 拆词」才会带这个参数）。
+app.get('/api/glue-word/:word', async (req, res) => {
+    const word = (req.params.word || '').trim();
+    if (!word) return res.status(400).json({ error: '缺少 word 参数' });
+    if (word.length > 40) return res.status(400).json({ error: `词太长（${word.length} 字符，上限 40）` });
+
+    const allowAI = req.query.ai === '1' || req.query.ai === 'true';
+    const t0 = Date.now();
+    try {
+        const r = allowAI
+            ? await coze.splitGluedWord(word, { allowAI: true })
+            : coze.segmentGluedWord(word);
+
+        // 只回传前端要用的字段，别把整条词典记录（英文释义/词形表等）塞进响应
+        const slim = (entry) => entry ? {
+            word: entry.word,
+            phoneticPretty: entry.phoneticPretty || null,
+            translationLines: entry.translationLines || [],
+            pos: entry.pos || null,
+            collins: entry.collins || 0,
+            oxford: entry.oxford || 0,
+            tagList: entry.tagList || [],
+            lemma: entry.lemma || null,
+            bnc: entry.bnc || 0
+        } : null;
+
+        const payload = {
+            success: true,
+            word: r.word || word.toLowerCase(),
+            isGlued: !!r.isGlued,
+            method: r.method,
+            elapsedMs: Date.now() - t0,
+            merged: {
+                word: (r.merged && r.merged.word) || word.toLowerCase(),
+                found: !!(r.merged && r.merged.entry),
+                entry: slim(r.merged && r.merged.entry)
+            },
+            parts: (r.parts || []).map(p => ({
+                word: p.word,
+                found: !!p.entry,
+                entry: slim(p.entry),
+                // 拆出来的每一段也走一遍「本地兜底释义」，词典没有时还能从 word_context / word_cache 拿
+                fallbackMeaning: p.entry ? null : (coze.resolveLocalMeaning(p.word).meaning || null)
+            }))
+        };
+
+        if (payload.isGlued) {
+            console.log(`🧩 [glue-word] "${payload.word}" → ${payload.parts.map(p => p.word).join(' + ')}`
+                + `（${payload.method} | ${payload.elapsedMs}ms | ai=${allowAI}）`);
+        } else {
+            console.log(`🧩 [glue-word] "${payload.word}" 未拆开（合并词${payload.merged.found ? '已收录' : '未收录'}`
+                + ` | ${payload.elapsedMs}ms | ai=${allowAI}）`);
+        }
+        res.json(payload);
+    } catch (e) {
+        console.error(`❌ [glue-word] "${word}" 失败: ${e.message}`);
+        res.status(500).json({ error: e.message });
+    }
 });
 
 // 新增一条释义（不覆盖已有释义）；带 context 时同时写入语境库
@@ -478,19 +937,56 @@ app.get('/api/user-words', (req, res) => {
     const userId = getUserIdFromReq(req);
     const status = req.query.status || 'all';
     const rows = dbOps.getUserWords(userId, status);
-    res.json(rows.map(r => ({
-        id: r.id,
-        word: r.word,
-        definition: r.definition,
-        sentence: r.sentence,
-        articleId: r.article_id,
-        paragraphIndex: r.paragraph_index,
-        sentenceIndex: r.sentence_index,
-        status: r.status,
-        knowledge: r.knowledge,
-        collectedAt: r.collected_at,
-        nextReviewAt: r.next_review_at
-    })));
+
+    // 释义兜底（2026-10-06）：user_words.definition 是「收藏那一刻」写进去的快照，
+    // 历史上拖拽路径写死了 '暂无释义'（实测 35 条里 25 条中招），列表于是全显示「暂无释义」。
+    // 这里对「空 / 暂无释义」的行用本地三层（词典层首义 → 语境库 → 通用词库）现场补一个，
+    // 并额外带上 dictionary（音标 + 全部义项），前端单词本可以直接渲染完整释义。
+    let patched = 0;
+    const out = rows.map(r => {
+        const stored = (r.definition || '').trim();
+        const needsFill = !stored || stored === '暂无释义';
+        let meaning = stored;
+        let meaningSource = stored ? 'stored' : null;
+        let dictionary = null;
+
+        if (needsFill) {
+            const local = coze.resolveLocalMeaning(r.word, r.sentence);
+            if (local.meaning) {
+                meaning = local.meaning;
+                meaningSource = local.source;
+                patched++;
+            } else {
+                meaning = '';           // 真的查不到 → 给空串，前端显示「暂无释义」占位并允许手动补
+                meaningSource = null;
+            }
+        }
+        try {
+            dictionary = dbOps.getDictionaryEntry(r.word);
+        } catch (e) {
+            dictionary = null;
+        }
+
+        return {
+            id: r.id,
+            word: r.word,
+            definition: r.definition,      // 原样保留（排查数据质量用）
+            meaning,                       // 前端直接渲染这个
+            meaningSource,                 // stored | dictionary | context | cache | null
+            dictionary,                    // 音标 / 中文义项 / 英文释义 / 词性 / 星级
+            sentence: r.sentence,
+            articleId: r.article_id,
+            paragraphIndex: r.paragraph_index,
+            sentenceIndex: r.sentence_index,
+            status: r.status,
+            knowledge: r.knowledge,
+            collectedAt: r.collected_at,
+            nextReviewAt: r.next_review_at
+        };
+    });
+
+    console.log(`📚 [user-words] user=${userId} status=${status} | 返回 ${out.length} 条 | 释义兜底补全 ${patched} 条（原 definition 为空/暂无释义）`);
+    res.json(out);
 });
 
 // 判断某句中单词是否已收藏
@@ -533,6 +1029,32 @@ app.post('/api/collect-word', (req, res) => {
     } else {
         res.json({ success: false, reason: result.reason, message: '本句中已收藏过这个词' });
     }
+});
+
+// 取消收藏（2026-10-09 新增）：从 user_words 删除
+//   参数（query 或 body 均可）：
+//     id                     —— 直接按主键删（带 user_id 归属校验）
+//     word（必填，除非给了 id）
+//     articleId（可选）       —— 给了就限定在这篇文章
+//     sentence（可选）        —— 给了就只删「本句」那一条；只给 articleId 则删该词在本篇的全部行
+//   返回 { success, deleted }，deleted 为真正删除的行数（0 说明本来就没收藏）。
+app.delete('/api/collect-word', (req, res) => {
+    const userId = getUserIdFromReq(req);
+    const src = Object.assign({}, req.query, req.body || {});
+    const { id, word, articleId, sentence } = src;
+
+    if (id !== undefined && id !== null && id !== '') {
+        const numId = parseInt(id, 10);
+        if (!Number.isFinite(numId)) return res.status(400).json({ error: 'id 非法' });
+        const r = dbOps.deleteUserWordById(numId, userId);
+        console.log(`🗑️ [取消收藏] by id=${numId} user=${userId} → deleted=${r.deleted}`);
+        return res.json({ success: true, deleted: r.deleted });
+    }
+
+    if (!word) return res.status(400).json({ error: '缺少 word（或 id）' });
+    const r = dbOps.deleteUserWords(userId, word, articleId || null, sentence || null);
+    console.log(`🗑️ [取消收藏] word="${word}" article=${articleId || '（全部）'} sentence=${sentence ? '限定本句' : '（不限）'} user=${userId} → deleted=${r.deleted}`);
+    res.json({ success: true, deleted: r.deleted, word: word });
 });
 
 // 更新单词分类状态（已掌握/学习中/需复习）
@@ -620,10 +1142,13 @@ app.post('/api/migrate', (req, res) => {
 app.listen(PORT, () => {
     console.log('\n🍎 金苹果之旅 - 后端服务启动成功！（企业级架构版）');
     console.log('========================================');
+    console.log(`🔌 端口:      ${PORT}  [来源: ${PORT_FROM_ENV ? '环境变量 PORT' : '默认值 3000（环境变量 PORT 未设置）'}]`);
     console.log(`📍 访问地址:  http://localhost:${PORT}`);
-    console.log(`🔌 API 端口:  ${PORT}`);
     console.log(`📦 静态目录:  ${__dirname}`);
-    console.log(`🗄️  数据库:    SQLite (${process.env.DATABASE_PATH || './data/app.db'})`);
+    console.log(`🗄️  数据库:    SQLite (${dbOps.DB_PATH})  [来源: ${dbOps.DB_PATH_SOURCE === 'default' ? '默认值' : '环境变量 ' + dbOps.DB_PATH_SOURCE}]`);
+    console.log(`🧩 词典库:    ${dbOps.DICT_PATH}`);
+    const _dict = dbOps.getDictionaryStats();
+    console.log(`📖 词典库:    ${_dict.ready ? `✅ ${_dict.entries} 词条 / ${_dict.fileSizeMb} MB` : `⚠️  未导入（npm run dict:download 或 npm run dict:import）`}`);
     console.log(`🔄 异步队列:  进程内轻量队列 (重试 ${process.env.QUEUE_MAX_RETRIES || 3} 次)`);
     console.log(`🤖 Coze:      ${coze.isCozeConfigured() ? '✅ 已配置' : '⚠️  未配置 (.env)'}`);
     console.log(`🩺 健康检查:  http://localhost:${PORT}/health`);

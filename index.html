@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>金苹果之旅 - 测试缓存</title>
+    <title>金苹果之旅 </title>
     <style>
         :root {
             /* Figma Dashboard Color Palette */
@@ -21,6 +21,9 @@
             --border: #E8DDD0;
             --green: #6B9B37;
             --green-light: #D1FAE5;
+            /* --correct 早就在用（.progress-fill、单词本「已掌握」、练习屏判定）却一直没定义，
+               2026-10-09 补上：原来 var() 解析失败会退化成「无颜色」= 继承色，不同元素表现不一致。 */
+            --correct: #4CAF50;
             --blue: #3B82F6;
             --blue-light: #DBEAFE;
             --purple: #6366F1;
@@ -273,7 +276,12 @@
             border: 1px solid rgba(232, 145, 45, 0.12);
             min-width: 260px;
             max-width: 340px;
-            z-index: 1000;
+            /* 词典式卡片的「其他释义」是完整义项列表，长词（can / run 这类）能列十几条，
+               不设上限会直接顶出屏幕 → 限制高度并允许卡片内部滚动 */
+            max-height: 72vh;
+            overflow-y: auto;
+            overscroll-behavior: contain;
+            z-index: 1300;
             animation: fadeIn 0.2s ease-out;
         }
 
@@ -367,6 +375,24 @@
             background: var(--primary-dark);
             transform: translateY(-1px);
             box-shadow: 0 4px 10px rgba(232, 145, 45, 0.35);
+        }
+        /* 取消收藏：平时安静的中性灰，悬停才泛红（不抢「标记 / 收藏」的视觉焦点） */
+        .wc-btn-uncollect {
+            background: #F1F3F5;
+            color: #6B7280;
+            border: 1px solid #E3E6E9;
+        }
+        .wc-btn-uncollect:hover {
+            background: #FEE2E2;
+            color: #DC2626;
+            border-color: #FCA5A5;
+            transform: translateY(-1px);
+            box-shadow: 0 3px 8px rgba(220, 38, 38, 0.15);
+        }
+        .wc-btn-uncollect:disabled {
+            opacity: 0.6;
+            cursor: default;
+            transform: none;
         }
         .wc-btn:active {
             transform: translateY(0);
@@ -1189,6 +1215,17 @@
             background: #E0E7FF;
         }
 
+        /* 释义锁开关：锁上时换成暖色，与「🌐 显示译文」明显区分
+           （两个按钮都用 🔒 图标会让人分不清哪个是哪个，配色来兜住） */
+        .toolbar-btn.lock-on {
+            background: #FAEEDA;
+            color: #854F0B;
+            font-weight: 600;
+        }
+        .toolbar-btn.lock-on:hover {
+            background: #FAC775;
+        }
+
         /* My Wordbook */
         .wordbook-header {
             display: flex;
@@ -1278,6 +1315,100 @@
         .quiz-progress-text {
             font-size: 0.85rem;
             color: var(--gray);
+        }
+
+        /* 测试页：文章主区域 + 弹出题目面板（按钮开关） */
+        .quiz-article-main {
+            max-width: 860px;
+            margin: 0 auto;
+            padding-bottom: 6rem;
+        }
+
+        .quiz-panel-toggle {
+            position: fixed;
+            right: 0;
+            top: 50%;
+            transform: translateY(-50%);
+            z-index: 1003;
+            border: none;
+            cursor: pointer;
+            background: var(--primary);
+            color: #fff;
+            padding: 0.9rem 0.55rem;
+            border-radius: 0.6rem 0 0 0.6rem;
+            writing-mode: vertical-rl;
+            text-orientation: mixed;
+            font-size: 0.95rem;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            line-height: 1.2;
+            box-shadow: -2px 0 10px rgba(0, 0, 0, 0.15);
+            transition: background 0.2s, opacity 0.2s;
+        }
+
+        .quiz-panel-toggle:hover:not(:disabled) {
+            background: var(--primary-dark);
+        }
+
+        .quiz-panel-toggle:disabled {
+            opacity: 0.55;
+            cursor: not-allowed;
+        }
+
+        .quiz-panel {
+            position: fixed;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            width: min(480px, 100vw);
+            transform: translateX(100%);
+            transition: transform 0.3s ease;
+            z-index: 1002;
+            background: var(--bg);
+            box-shadow: -6px 0 24px rgba(0, 0, 0, 0.15);
+        }
+
+        .quiz-panel.open {
+            transform: translateX(0);
+        }
+
+        .quiz-panel-inner {
+            height: 100%;
+            overflow-y: auto;
+            padding: 1.25rem 3rem 2rem 1.25rem;   /* 右侧给竖排开关按钮让位 */
+        }
+
+        @media (max-width: 900px) {
+            .quiz-panel-toggle {
+                right: auto;
+                top: auto;
+                left: 50%;
+                bottom: 24px;
+                transform: translateX(-50%);
+                writing-mode: horizontal-tb;
+                padding: 0.7rem 1.5rem;
+                border-radius: 2rem;
+                box-shadow: 0 2px 12px rgba(0, 0, 0, 0.18);
+            }
+
+            .quiz-panel {
+                top: auto;
+                right: 0;
+                left: 0;
+                bottom: 0;
+                width: 100%;
+                height: 70vh;
+                transform: translateY(100%);
+                box-shadow: 0 -6px 24px rgba(0, 0, 0, 0.15);
+            }
+
+            .quiz-panel.open {
+                transform: translateY(0);
+            }
+
+            .quiz-panel-inner {
+                padding: 1.25rem 1.25rem 5rem;   /* 底部给悬浮开关按钮让位 */
+            }
         }
 
         .question-card {
@@ -1608,6 +1739,24 @@
             gap: 0.5rem;
         }
         .fallback-notice .fallback-notice-icon { font-size: 1.1rem; }
+        .fallback-notice .fallback-notice-text { flex: 1 1 auto; }
+
+        /* 句子翻译失败提示条里的「重试」按钮（2026-10-07） */
+        .sentence-retry-btn {
+            flex: 0 0 auto;
+            padding: 0.3rem 0.9rem;
+            border: 1px solid #D97706;
+            background: #FFFFFF;
+            color: #B45309;
+            border-radius: 0.4rem;
+            font-size: 0.8rem;
+            font-weight: 600;
+            line-height: 1.2;
+            cursor: pointer;
+            transition: background 0.15s ease, color 0.15s ease;
+        }
+        .sentence-retry-btn:hover:not(:disabled) { background: #D97706; color: #FFFFFF; }
+        .sentence-retry-btn:disabled { opacity: 0.6; cursor: not-allowed; }
 
         /* Word list styles */
         .word-list {
@@ -1643,26 +1792,209 @@
             color: var(--gray);
         }
 
+        /* ==================== 总结页「收藏的单词」卡片网格（2026-10-09 重排） ====================
+           旧版容器是 .word-list（flex 横排）+ 每项 .word-tag（无样式）→ 所有词挤成一行
+           `词 · 释义`，词义一长完全糊在一起。现在一律「一词一卡」，单词/释义/括号备注各占一行。 */
+        .summary-word-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+            gap: 0.6rem;
+        }
+        .summary-word-card {
+            background: var(--bg-light);
+            border: 1px solid var(--border);
+            border-left: 3px solid var(--primary);
+            border-radius: 0.6rem;
+            padding: 0.55rem 0.7rem 0.6rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.18rem;
+            min-width: 0;
+        }
+        .summary-word-card .sw-head {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 0.4rem;
+        }
+        .summary-word-card .sw-word {
+            font-size: 1rem;
+            font-weight: 700;
+            color: var(--primary-dark);
+            line-height: 1.25;
+            word-break: break-word;
+        }
+        .summary-word-card .sw-idx {
+            flex: none;
+            font-size: 0.68rem;
+            font-weight: 700;
+            color: var(--gray);
+            background: var(--bg-lighter);
+            border-radius: 0.5rem;
+            padding: 0.05rem 0.38rem;
+            line-height: 1.4;
+        }
+        .summary-word-card .sw-meaning {
+            font-size: 0.82rem;
+            color: var(--text);
+            line-height: 1.45;
+            word-break: break-word;
+        }
+        .summary-word-card .sw-note {
+            font-size: 0.72rem;
+            color: var(--gray);
+            line-height: 1.4;
+            word-break: break-word;
+        }
+
+        /* ==================== 练习屏：学习 / 复习 / 每日挑战（2026-10-09） ==================== */
+        .practice-wrap { max-width: 640px; margin: 0 auto; padding: 16px 20px 80px; }
+        .practice-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; margin-bottom: 0.75rem; }
+        .practice-title { font-size: 1.25rem; font-weight: 800; color: var(--text); }
+        .practice-sub { font-size: 0.8rem; color: var(--gray); margin-top: 0.15rem; }
+        .practice-progress { flex: none; font-size: 1.05rem; font-weight: 800; color: var(--primary); }
+        .practice-bar { height: 6px; background: var(--bg-lighter); border-radius: 999px; overflow: hidden; margin-bottom: 1.25rem; }
+        .practice-bar-fill { height: 100%; background: linear-gradient(135deg, var(--primary), var(--primary-dark)); transition: width 0.25s ease; }
+
+        .practice-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 1rem;
+            padding: 1.75rem 1.5rem;
+            min-height: 240px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            gap: 0.75rem;
+        }
+        .practice-word {
+            font-size: 2.1rem;
+            font-weight: 800;
+            color: var(--primary-dark);
+            letter-spacing: 0.01em;
+            word-break: break-word;
+            line-height: 1.2;
+        }
+        .practice-hint { font-size: 0.82rem; color: var(--gray); }
+        .practice-sentence {
+            font-size: 0.92rem;
+            color: var(--text);
+            background: var(--bg-light);
+            border-radius: 0.6rem;
+            padding: 0.65rem 0.85rem;
+            line-height: 1.6;
+            max-width: 100%;
+        }
+        .practice-sentence b { color: var(--primary-dark); }
+        /* 拼写题的例句空位：目标词被替换成下划线（可选保留前半作为「词根提示」） */
+        .practice-blank {
+            font-weight: 800;
+            color: var(--primary-dark);
+            letter-spacing: 0.02em;
+            padding: 0 0.1em;
+            white-space: nowrap;
+        }
+        .practice-meaning {
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: var(--text);
+            line-height: 1.5;
+        }
+        .practice-divider { width: 48px; height: 3px; border-radius: 999px; background: var(--bg-lighter); }
+        .practice-prompt { font-size: 1.05rem; font-weight: 700; color: var(--text); line-height: 1.6; }
+
+        .practice-options { display: flex; flex-direction: column; gap: 0.55rem; width: 100%; }
+        .practice-option {
+            width: 100%;
+            text-align: left;
+            padding: 0.75rem 0.9rem;
+            border: 1px solid var(--border);
+            border-radius: 0.7rem;
+            background: #fff;
+            color: var(--text);
+            font-size: 0.95rem;
+            line-height: 1.5;
+            cursor: pointer;
+            transition: all 0.15s;
+            display: flex;
+            gap: 0.6rem;
+            align-items: baseline;
+        }
+        .practice-option:hover { border-color: var(--primary); background: var(--primary-light); }
+        .practice-option .opt-key {
+            flex: none;
+            font-weight: 800;
+            color: var(--primary-dark);
+            min-width: 1.1em;
+        }
+        .practice-option.correct { border-color: var(--correct); background: rgba(76, 175, 80, 0.1); }
+        .practice-option.wrong { border-color: #E05252; background: rgba(224, 82, 82, 0.1); }
+        .practice-option[disabled] { cursor: default; }
+
+        .practice-input {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 0.8rem 0.9rem;
+            border: 2px solid var(--border);
+            border-radius: 0.7rem;
+            font-size: 1.15rem;
+            text-align: center;
+            letter-spacing: 0.06em;
+            outline: none;
+            background: #fff;
+        }
+        .practice-input:focus { border-color: var(--primary); }
+        .practice-input.correct { border-color: var(--correct); }
+        .practice-input.wrong { border-color: #E05252; }
+
+        .practice-actions { display: flex; gap: 0.6rem; margin-top: 1.25rem; }
+        .practice-btn {
+            flex: 1;
+            padding: 0.8rem 1rem;
+            border: none;
+            border-radius: 0.7rem;
+            font-size: 0.95rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .practice-btn.primary { background: linear-gradient(135deg, var(--primary), var(--primary-dark)); color: #fff; box-shadow: 0 4px 14px rgba(232, 145, 45, 0.28); }
+        .practice-btn.primary:hover { transform: translateY(-1px); }
+        .practice-btn.ghost { background: #fff; border: 1px solid var(--border); color: var(--text); }
+        .practice-btn.ghost:hover { border-color: var(--primary); color: var(--primary-dark); }
+        .practice-btn.ok { background: var(--correct); color: #fff; }
+        .practice-btn.no { background: #fff; border: 1px solid #E05252; color: #C0392B; }
+        .practice-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+        .practice-result-icon { font-size: 3rem; line-height: 1; }
+        .practice-result-title { font-size: 1.15rem; font-weight: 800; color: var(--text); }
+        .practice-result-line { font-size: 0.9rem; color: var(--gray); }
+
         /* ==================== 拖拽收集区 ==================== */
         .collect-zone {
             position: fixed;
-            top: 50%;
-            right: 16px;
-            transform: translateY(-50%);
-            width: 80px;
-            min-height: 140px;
+            bottom: 24px;
+            left: 24px;
+            top: auto;
+            right: auto;
+            transform: none;
+            width: auto;
+            height: 56px;
+            min-height: 0;
             background: var(--card);
-            border: 3px dashed var(--border);
-            border-radius: 1rem;
+            border: 2px dashed var(--primary);
+            border-radius: 2rem;
             display: none;
-            flex-direction: column;
+            flex-direction: row;
             align-items: center;
             justify-content: center;
             gap: 0.5rem;
             z-index: 900;
             transition: all 0.3s ease;
-            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.06);
-            padding: 1rem 0.5rem;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
+            padding: 0 1rem;
         }
 
         .collect-zone.active {
@@ -1670,7 +2002,7 @@
             background: var(--primary-light);
             box-shadow: 0 0 0 4px rgba(232, 145, 45, 0.15),
                         0 8px 32px rgba(232, 145, 45, 0.25);
-            transform: translateY(-50%) scale(1.05);
+            transform: scale(1.05);
         }
 
         .collect-zone-icon {
@@ -2336,31 +2668,33 @@
             border-radius: 3px;
         }
 
-        /* 句子翻译悬停浮层（右侧固定，5 秒悬停后滑出） */
+        /* 句子翻译悬停浮层（句子上方显示，宽度自适应最大 400px） */
         .article-sentence {
             cursor: default;
         }
         .sentence-hover-panel {
             position: fixed;
-            top: 50%;
-            right: 24px;
-            transform: translateY(-50%) translateX(10px);
-            width: 300px;
-            max-width: calc(100vw - 48px);
+            top: 0;
+            left: 0;
+            width: auto;
+            min-width: 220px;
+            max-width: 400px;
             max-height: 60vh;
             overflow-y: auto;
+            white-space: normal;
+            word-wrap: break-word;
             background: #FFFFFF;
             border-radius: 12px;
             box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
             padding: 1rem 1.1rem;
             opacity: 0;
             pointer-events: none;
-            transition: all 0.3s ease;
-            z-index: 1100;
+            transition: opacity 0.2s ease;
+            z-index: 99999;
         }
         .sentence-hover-panel.visible {
-            transform: translateY(-50%) translateX(0);
             opacity: 1;
+            pointer-events: auto;
         }
         .sentence-hover-panel .shp-origin {
             font-size: 0.95rem;
@@ -2376,6 +2710,253 @@
             padding-left: 0.5rem;
             border-left: 3px solid var(--border);
         }
+
+        /* 释义锁：句子被锁住时的「🔓 看翻译」按钮 */
+        .sentence-hover-panel .shp-reveal {
+            display: block;
+            width: 100%;
+            margin-top: 0.6rem;
+            padding: 0.45rem 0.6rem;
+            border: 1px dashed #BA7517;
+            border-radius: 0.6rem;
+            background: #FAEEDA;
+            color: #854F0B;
+            font-size: 0.85rem;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .sentence-hover-panel .shp-reveal:hover {
+            background: #FAC775;
+        }
+    /* ==================== 主页面：阅读 + 收藏 + 题目 三合一 ==================== */
+        #readingPage {
+            max-width: 1440px;
+            margin: 0 auto;
+            padding: 20px 24px 120px;
+        }
+        .main-topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+            margin-bottom: 0.75rem;
+            position: sticky;
+            top: 0;
+            background: var(--bg);
+            padding: 0.5rem 0;
+            z-index: 500;
+        }
+        .main-topbar .back-btn { margin-bottom: 0; }
+        .topbar-center {
+            display: flex;
+            align-items: center;
+            flex: 1;
+            min-width: 0;
+            gap: 0.5rem;
+        }
+        .topbar-center .reading-title {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .finish-learning-btn {
+            flex: none;
+            background: linear-gradient(135deg, var(--green), #4E7A26);
+            color: #fff;
+            border: none;
+            border-radius: 2rem;
+            padding: 0.6rem 1.15rem;
+            font-size: 0.9rem;
+            font-weight: 700;
+            cursor: pointer;
+            box-shadow: 0 4px 14px rgba(107, 155, 55, 0.3);
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+        .finish-learning-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(107, 155, 55, 0.4); }
+
+        /* ==================== 「待分类」入口（2026-10-08）==================== */
+        /* 2026-10-08 二次调整：阅读页右上「📋 待分类」按钮连同 .pending-entry-* 样式一起**移除**
+           （用户要求：顶部是文章标题区，不适合放入口）。
+           待分类入口现在只有三个：①「📚 我的收藏」头部「📋 去分类 N」②右侧收集区点击 ③总结页按钮。 */
+
+        /* 「我的收藏」头部「去分类」小按钮 —— 这是阅读页里「待分类」的正式入口 */
+        .favs-sort-btn {
+            border: 1px solid var(--primary);
+            background: var(--primary-light, #FDF3E7);
+            color: var(--primary-dark);
+            border-radius: 999px;
+            padding: 0.2rem 0.6rem;
+            font-size: 0.75rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+        .favs-sort-btn:hover { background: var(--primary); color: #fff; }
+        .favs-sort-btn.is-empty { opacity: 0.5; }
+
+        /* 总结页「去分类待学单词」 */
+        .summary-sort-btn {
+            width: 100%;
+            margin-top: 0.75rem;
+            padding: 0.7rem 1rem;
+            border: none;
+            border-radius: 0.75rem;
+            background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+            color: #fff;
+            font-size: 0.92rem;
+            font-weight: 700;
+            cursor: pointer;
+            box-shadow: 0 4px 14px rgba(232, 145, 45, 0.28);
+            transition: all 0.2s;
+        }
+        .summary-sort-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(232, 145, 45, 0.38); }
+
+        /* 收集区可点击提示 */
+        .collect-zone { cursor: pointer; }
+        .collect-zone-text { line-height: 1.25; }
+        .collect-zone-sub { font-size: 0.7rem; opacity: 0.75; }
+
+        .reading-layout {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 400px;
+            gap: 1.25rem;
+            align-items: start;
+        }
+        .reading-left {
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+        .reading-left .reading-content { margin-bottom: 0; }
+        .reading-right {
+            position: sticky;
+            top: 64px;
+            max-height: calc(100vh - 80px);
+            overflow-y: auto;
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 1rem;
+            padding: 1.25rem;
+            box-shadow: 0 2px 12px rgba(0, 0, 0, 0.04);
+        }
+
+        /* 收藏区（横向滚动） */
+        .reading-favs {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 1rem;
+            padding: 1rem 1.1rem;
+        }
+        .reading-favs-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 0.6rem;
+        }
+        .reading-favs-label { font-size: 0.95rem; font-weight: 700; color: var(--text); }
+        .reading-favs-count { font-size: 0.8rem; color: var(--gray); }
+        .reading-favs-progress {
+            height: 6px;
+            background: var(--border);
+            border-radius: 999px;
+            overflow: hidden;
+            margin-bottom: 0.75rem;
+        }
+        .reading-favs-bar {
+            height: 100%;
+            background: linear-gradient(90deg, var(--primary), var(--primary-dark));
+            border-radius: 999px;
+            transition: width 0.3s;
+        }
+        .reading-favs-list {
+            display: flex;
+            gap: 0.5rem;
+            overflow-x: auto;
+            padding-bottom: 0.25rem;
+        }
+        .fav-chip {
+            flex: none;
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            gap: 0.15rem;
+            background: var(--primary-light);
+            border: 1px solid var(--primary-lighter);
+            border-radius: 0.75rem;
+            padding: 0.5rem 0.75rem;
+            padding-right: 1.6rem;   /* 给右上角「取消收藏」留位，别压到单词 */
+            min-width: 96px;
+        }
+        .fav-chip .fav-word { font-weight: 700; font-size: 0.95rem; color: var(--text); }
+        .fav-chip .fav-meaning { font-size: 0.75rem; color: var(--gray); line-height: 1.3; }
+        /* 取消收藏：chip 右上角的极小 ✕，平时淡灰如隐形，悬停变红提示「可移除」 */
+        .fav-chip .fav-remove {
+            position: absolute;
+            top: 0.28rem;
+            right: 0.28rem;
+            width: 1.15rem;
+            height: 1.15rem;
+            padding: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: none;
+            border-radius: 50%;
+            background: transparent;
+            color: #A6AFB8;
+            font-size: 0.7rem;
+            line-height: 1;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .fav-chip .fav-remove:hover {
+            background: #FEE2E2;
+            color: #DC2626;
+        }
+        .fav-chip .fav-remove:disabled { opacity: 0.5; cursor: default; }
+
+        /* 结算/总结页面 */
+        #summaryPage {
+            max-width: 760px;
+            margin: 0 auto;
+            padding: 40px 24px 80px;
+        }
+        .summary-container { display: flex; flex-direction: column; gap: 1.25rem; }
+        .summary-stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 0.75rem;
+        }
+        .summary-stat-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 1rem;
+            text-align: center;
+            padding: 1.25rem 0.75rem;
+        }
+        .summary-stat-num { font-size: 1.9rem; font-weight: 800; color: var(--primary); }
+        .summary-stat-label { font-size: 0.8rem; color: var(--gray); margin-top: 0.25rem; }
+        .summary-section {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 1rem;
+            padding: 1.25rem;
+        }
+        .summary-section-title { font-size: 1rem; font-weight: 700; margin-bottom: 0.75rem; }
+
+        /* 主页面响应式 */
+        @media (max-width: 1024px) {
+            .reading-layout { grid-template-columns: 1fr; }
+            .reading-right { position: static; max-height: none; }
+        }
+        @media (max-width: 900px) {
+            #readingPage { padding: 16px 12px 90px; }
+            .summary-stats { grid-template-columns: 1fr; }
+        }
+
     </style>
 </head>
 <body>
@@ -2558,37 +3139,39 @@
                         </div>
                         <div class="action-info">
                             <div class="action-title">My Wordbooks</div>
-                            <div class="action-sub">4 collections</div>
+                            <div class="action-sub" id="qaWordbooksSub">0 collections</div>
                         </div>
                         <span class="action-arrow">›</span>
                     </div>
-                    <div class="action-item">
+                    <!-- 2026-10-09：下面三个原来只有壳（无 onclick、sub 写死），现在都接上真功能。
+                         sub 里的计数由 app.js renderQuickActions() 每次进首页时刷新。 -->
+                    <div class="action-item" onclick="startPractice('learn')">
                         <div class="action-icon green">
                             <img src="电.svg" alt="Learn" width="24" height="24">
                         </div>
                         <div class="action-info">
                             <div class="action-title">Learn Vocabulary</div>
-                            <div class="action-sub">6 new words</div>
+                            <div class="action-sub" id="qaLearnSub">—</div>
                         </div>
                         <span class="action-arrow">›</span>
                     </div>
-                    <div class="action-item">
+                    <div class="action-item" onclick="startPractice('review')">
                         <div class="action-icon blue">
                             <img src="退出_下一页.svg" alt="Review" width="24" height="24">
                         </div>
                         <div class="action-info">
                             <div class="action-title">Review Words</div>
-                            <div class="action-sub">8 due today</div>
+                            <div class="action-sub" id="qaReviewSub">—</div>
                         </div>
                         <span class="action-arrow">›</span>
                     </div>
-                    <div class="action-item">
+                    <div class="action-item" onclick="startPractice('challenge')">
                         <div class="action-icon orange">
                             <img src="人.svg" alt="Challenge" width="24" height="24">
                         </div>
                         <div class="action-info">
                             <div class="action-title">Daily Challenge</div>
-                            <div class="action-sub">+50 XP</div>
+                            <div class="action-sub" id="qaChallengeSub">+1 🍎</div>
                         </div>
                         <span class="action-arrow">›</span>
                     </div>
@@ -2611,7 +3194,7 @@
 
             <div class="card" style="margin-bottom: 1rem;">
                 <label class="form-label">文章标题（可选）</label>
-                <input type="text" class="form-input" id="uploadTitle" placeholder="请输入文章标题" style="margin-bottom: 1rem;">
+                <input type="text" class="form-input" id="uploadTitle" placeholder="请输入文章标题" autocomplete="off" style="margin-bottom: 1rem;">
 
                 <label class="form-label">文章内容</label>
                 <textarea id="uploadContent" class="form-textarea" rows="14" placeholder="请粘贴英语文章内容..."></textarea>
@@ -2623,8 +3206,8 @@
             </div>
 
             <div class="file-upload-area">
-                <div class="file-upload-label">📂 或上传 txt 文件</div>
-                <input type="file" id="fileUpload" accept=".txt" style="width: 100%; padding: 0.5rem; font-size: 0.9rem;">
+                <div class="file-upload-label">📂 或上传文件（支持 txt / md / pdf / docx）</div>
+                <input type="file" id="fileUpload" accept=".txt,.md,.pdf,.docx" style="width: 100%; padding: 0.5rem; font-size: 0.9rem;">
             </div>
 
             <div class="action-buttons">
@@ -2662,60 +3245,101 @@
         </div>
     </div>
 
-    <!-- Reading Page (Reading) -->
+    <!-- 主页面（阅读 + 收藏 + 题目 三合一） -->
     <div class="screen" id="readingPage">
-        <div class="back-btn" onclick="backToMain()">← 返回</div>
-
-        <div id="articleSelector" style="display: flex; gap: 0.5rem; overflow-x: auto; padding-bottom: 0.75rem; margin-bottom: 1rem;"></div>
-
-        <div class="reading-content">
-            <div class="reading-header">
+        <div class="main-topbar">
+            <div class="back-btn" onclick="backToMain()" style="flex:none;">← 返回</div>
+            <div class="topbar-center">
                 <span id="readDiff" class="diff-badge"></span>
                 <h1 class="reading-title" id="readTitle"></h1>
             </div>
-            <div class="reading-desc" id="readDesc"></div>
-
-            <!-- AI 降级题目提示条（isFallback=true 时显示） -->
-            <div class="fallback-notice hidden" id="fallbackNotice">
-                <span class="fallback-notice-icon">⚠️</span>
-                <span>AI 服务暂时不可用，已切换到基础模式</span>
-            </div>
-
-            <div class="reading-toolbar">
-                <button class="toolbar-btn" onclick="toggleTranslations()" id="toggleTransBtn">
-                    🌐 显示译文
-                </button>
-            </div>
-
-            <div id="readContent"></div>
-
-            <!-- 句子翻译悬停浮层（右侧固定，悬停句子 5 秒后滑出） -->
-            <div id="sentenceHoverPanel" class="sentence-hover-panel">
-                <div class="shp-origin"></div>
-                <div class="shp-translation"></div>
-            </div>
-            
-            <!-- 完成阅读按钮（正文下方） -->
-            <div id="finishReadingSection" style="margin-top: 2rem; padding-top: 1.5rem; border-top: 1px dashed var(--border); text-align: center;">
-                <div style="font-size: 0.85rem; color: var(--gray); margin-bottom: 0.75rem;">读完了？整理一下你收藏的单词吧 📚</div>
-                <button class="finish-reading-btn" onclick="finishReading()" style="width: 100%; justify-content: center;">
-                    ✓ 完成阅读，整理单词
-                </button>
-            </div>
-
-            <!-- 题目区（加载占位 / 降级划线题） -->
-            <div id="quizLoadingBox" style="display:none; margin-top:1.5rem; padding:1rem 1.25rem; background:var(--card,#fff); border:1px dashed var(--border); border-radius:0.75rem; font-size:0.9rem; color:var(--text); text-align:center; line-height:1.5;"></div>
-            <div id="fallbackQuizArea" style="display:none; margin-top:1.5rem;"></div>
+            <!-- 2026-10-08：顶栏「📋 待分类」按钮已按要求**移除** —— 顶部是文章标题区，不适合放入口。
+                 待分类入口保留在：「📚 我的收藏」头部「📋 去分类 N」+ 右侧收集区点击 + 总结页按钮。
+                 （DOM 里不再有 #pendingEntryBtn / #pendingEntryCount，app.js 也不再查询它们。） -->
+            <button type="button" class="finish-learning-btn" id="finishLearningBtn" onclick="finishLearning()">✅ 完成学习</button>
         </div>
 
-        <div class="footer-bar">
-            <div style="font-size: 0.85rem; color: var(--gray); margin-bottom: 0.5rem;">
-                已收集: <span id="progText">0/0 生词</span>
+        <div id="articleSelector" style="display: flex; gap: 0.5rem; overflow-x: auto; padding-bottom: 0.75rem; margin-bottom: 0.75rem;"></div>
+
+        <div class="reading-layout">
+            <!-- 左列：文章 + 收藏区 -->
+            <div class="reading-left">
+                <div class="reading-desc" id="readDesc"></div>
+
+                <!-- AI 降级题目提示条（isFallback=true 时显示） -->
+                <div class="fallback-notice hidden" id="fallbackNotice">
+                    <span class="fallback-notice-icon">⚠️</span>
+                    <span>AI 服务暂时不可用，已切换到基础模式</span>
+                </div>
+
+                <!-- 句子翻译失败提示条（文章 status='partial' 时显示；与上面的整篇降级提示互不干扰）
+                     2026-10-07：加「重试」按钮 —— 只重跑句子翻译工作流，正文/释义/题目不受影响 -->
+                <div class="fallback-notice hidden" id="sentenceFailNotice">
+                    <span class="fallback-notice-icon">⚠️</span>
+                    <span class="fallback-notice-text" id="sentenceFailNoticeText">句子翻译暂时不可用</span>
+                    <button type="button" class="sentence-retry-btn" id="sentenceRetryBtn"
+                            onclick="retrySentenceTranslation()">重试</button>
+                </div>
+
+                <div class="reading-toolbar">
+                    <!-- 释义锁（2026-10-07；2026-10-08 改默认）：**默认「查看模式」** —— 用户要求
+                         「刚打开文章先看内容，想猜再手动切」。全局开关，用户拨一次即落盘、之后一直沿用。
+                         文案/配色由 syncGuessLockButton() 同步（这里的初始值只为第一帧不闪） -->
+                    <button type="button" class="toolbar-btn" id="guessLockBtn"
+                            onclick="toggleGuessLock()"
+                            title="当前：点词直接显示释义（点这里切到猜词模式）">🔓 查看模式</button>
+                    <button class="toolbar-btn" onclick="toggleTranslations()" id="toggleTransBtn">🌐 显示译文</button>
+                </div>
+
+                <div class="reading-content">
+                    <div id="readContent"></div>
+                </div>
+
+                <!-- 收藏区（横向滚动） -->
+                <div class="reading-favs">
+                    <div class="reading-favs-head">
+                        <span class="reading-favs-label">📚 我的收藏</span>
+                        <div style="display:flex;align-items:center;gap:0.5rem;">
+                            <button type="button" class="favs-sort-btn" id="favsSortBtn"
+                                    onclick="openPendingFromReading()"
+                                    title="打开分类整理面板">📋 去分类</button>
+                            <span class="reading-favs-count" id="progText">0/0 生词</span>
+                        </div>
+                    </div>
+                    <div class="reading-favs-progress"><div class="reading-favs-bar" id="progBar" style="width: 0%;"></div></div>
+                    <div class="reading-favs-list" id="readingFavsList"></div>
+                </div>
             </div>
-            <div class="progress-bar" style="margin-bottom: 0.75rem;">
-                <div class="progress-fill" id="progBar" style="width: 0%;"></div>
+
+            <!-- 右列：题目 -->
+            <div class="reading-right">
+                <div class="quiz-header">
+                    <div>
+                        <h1>阅读理解</h1>
+                        <p id="quizArticleInfo"></p>
+                    </div>
+                    <span class="quiz-progress-text" id="quizProg">0/0</span>
+                </div>
+                <div class="progress-bar" style="margin-bottom: 1rem;">
+                    <div class="progress-fill" id="quizProgressBar" style="width: 0%;"></div>
+                </div>
+                <div id="quizQuestions"></div>
+                <div id="quizLoadingBox" style="display:none; margin-top:1rem; padding:1rem 1.25rem; background:var(--bg,#fff); border:1px dashed var(--border); border-radius:0.75rem; font-size:0.9rem; color:var(--text); text-align:center; line-height:1.5;"></div>
+                <div id="fallbackQuizArea" style="display:none; margin-top:1rem;"></div>
+                <div id="quizReview" style="margin-top:1rem;"></div>
+                <div style="margin-top: 1.25rem; padding-bottom: 0.5rem;">
+                    <div style="font-size: 0.85rem; color: var(--gray); text-align: center; margin-bottom: 0.75rem;" id="quizAnswered">0/0 answered</div>
+                    <button class="btn btn-primary" id="quizSubmitBtn" onclick="submitQuiz()" style="width: 100%;">提交答案 →</button>
+                </div>
             </div>
-            <button class="btn btn-primary" onclick="startQuiz()" id="startQuizBtn" style="width: 100%;">开始测试 →</button>
+        </div>
+
+        <!-- 句子翻译悬停浮层（句子上方显示，与单词释义卡片互斥） -->
+        <div id="sentenceHoverPanel" class="sentence-hover-panel">
+            <div class="shp-origin"></div>
+            <div class="shp-translation"></div>
+            <!-- 释义锁：猜词模式下只显示这一行按钮，点了才给译文（点击处理见 onSentenceRevealClick） -->
+            <button type="button" class="shp-reveal hidden" id="shpRevealBtn">🔓 看翻译</button>
         </div>
     </div>
 
@@ -2756,88 +3380,74 @@
         <div id="vocabContent"></div>
     </div>
 
-    <!-- Reading Comprehension Page -->
-    <div class="screen" id="quizPage">
-        <div class="back-btn" onclick="backToReading()">← 返回</div>
-
-        <div class="quiz-header">
-            <div>
-                <h1>阅读理解</h1>
-                <p id="quizArticleInfo"></p>
+    <!-- 练习屏（2026-10-09）：学习词汇 / 复习单词 / 每日挑战 共用。
+         #practiceBody 由 app.js renderPractice() 按模式与阶段整块重绘，
+         所以这里只放骨架（标题 / 进度 / 卡片 / 动作区），不放任何具体题目。 -->
+    <div class="screen" id="practicePage">
+        <div class="back-btn" onclick="exitPractice()">← 退出练习</div>
+        <div class="practice-wrap">
+            <div class="practice-head">
+                <div>
+                    <div class="practice-title" id="practiceTitle">练习</div>
+                    <div class="practice-sub" id="practiceSub"></div>
+                </div>
+                <div class="practice-progress" id="practiceProgress"></div>
             </div>
-            <span class="quiz-progress-text" id="quizProg">0/4</span>
-        </div>
-
-        <div class="progress-bar" style="margin-bottom: 1.5rem;">
-            <div class="progress-fill" id="quizProgressBar" style="width: 0%;"></div>
-        </div>
-
-        <div id="quizQuestions"></div>
-
-        <div class="footer-bar">
-            <div style="font-size: 0.85rem; color: var(--gray); text-align: center; margin-bottom: 0.75rem;" id="quizAnswered">0/4 answered</div>
-            <button class="btn btn-primary" onclick="submitQuiz()" style="width: 100%;">提交答案 →</button>
+            <div class="practice-bar"><div class="practice-bar-fill" id="practiceBarFill" style="width:0%"></div></div>
+            <div class="practice-card" id="practiceBody"></div>
+            <div class="practice-actions" id="practiceActions"></div>
         </div>
     </div>
 
-    <!-- Result Page (Result) -->
-    <div class="screen" id="resultPage">
-        <div class="result-header">
-            <h1>评测结果</h1>
-            <p>基于阅读和测试表现</p>
-        </div>
-
-        <div class="result-circle">
-            <div>
-                <div class="result-level" id="assLevel">B1</div>
-                <div class="result-level-label" id="assLevelLabel">Intermediate</div>
+    <!-- 结算/总结页面 -->
+    <div class="screen" id="summaryPage">
+        <div class="summary-container">
+            <div class="result-header">
+                <h1>🎉 本次学习总结</h1>
+                <p>阅读 · 收藏 · 答题 一览</p>
             </div>
-        </div>
 
-        <div class="result-dimensions">
-            <div class="dimension-card">
-                <div class="dimension-title">词汇维度</div>
-                <div class="dimension-metric">查词率</div>
-                <div class="dimension-value" style="color: var(--primary);" id="vocabScore">38%</div>
-                <div class="progress-bar" style="margin-bottom: 0.5rem;">
-                    <div class="progress-fill" id="vocabProgress" style="width: 38%;"></div>
+            <div class="summary-stats">
+                <div class="summary-stat-card">
+                    <div class="summary-stat-num" id="summaryArticlesRead">1</div>
+                    <div class="summary-stat-label">阅读文章数</div>
                 </div>
-                <div class="dimension-comment" id="vocabComment">继续阅读扩展词汇!</div>
-            </div>
-            <div class="dimension-card">
-                <div class="dimension-title">理解维度</div>
-                <div class="dimension-metric">答题正确率</div>
-                <div class="dimension-value" style="color: var(--correct);" id="compScore">75%</div>
-                <div class="progress-bar" style="margin-bottom: 0.5rem;">
-                    <div class="progress-fill" id="compProgress" style="width: 75%; background: linear-gradient(90deg, var(--correct), #34D399);"></div>
+                <div class="summary-stat-card">
+                    <div class="summary-stat-num" id="summaryCollectedCount">0</div>
+                    <div class="summary-stat-label">收藏单词数</div>
                 </div>
-                <div class="dimension-comment" id="compComment">理解良好!</div>
+                <div class="summary-stat-card">
+                    <div class="summary-stat-num" id="summaryAccuracy">—</div>
+                    <div class="summary-stat-label">答题正确率</div>
+                </div>
             </div>
-        </div>
 
-        <div class="result-comment" id="assComment">
-            你目前的水平是 B1。继续阅读，读得越多，知道的就越多!
-        </div>
-
-        <div style="margin-bottom: 1.5rem;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
-                <h3 style="font-size: 1rem; font-weight: 600;">收集的生词</h3>
-                <span style="font-size: 0.8rem; color: var(--gray);" id="collectedCount">0 words</span>
+            <div class="summary-section">
+                <h3 class="summary-section-title">📚 收藏的单词</h3>
+                <div id="summaryCollectedList" class="summary-word-grid"></div>
+                <!-- 2026-10-08：从总结页也能回到「待分类」——不然结算页会变成收藏词的终点。
+                     2026-10-08 二次修正：只列**本次学习**收藏且仍待分类的词（不累计历史存量），
+                     与结算页其它统计口径一致；历史存量请去「我的单词本 → 待分类」整理。 -->
+                <button type="button" class="summary-sort-btn" id="summarySortBtn"
+                        onclick="openSortPanelForSession()">📋 去分类待学单词</button>
             </div>
-            <div id="collectedList" class="word-list"></div>
-        </div>
 
-        <div class="result-actions">
-            <button class="btn btn-secondary" onclick="backToMain()">返回首页</button>
-            <button class="btn btn-primary" onclick="showVocabBook()">开始学习</button>
+            <div class="summary-section" id="summaryReview"></div>
+
+            <div class="result-actions">
+                <button class="btn btn-secondary" onclick="backToMain()">返回首页</button>
+                <button class="btn btn-primary" onclick="summaryContinue()">继续学习</button>
+            </div>
         </div>
     </div>
 
-    <!-- 单词收集区（右侧固定栏） -->
-    <div class="collect-zone" id="collectZone">
+    <!-- 单词收集区（右侧固定栏，2026-10-08 起可点击 → 打开「待分类」整理面板） -->
+    <div class="collect-zone" id="collectZone"
+         onclick="onCollectZoneClick(event)"
+         title="拖拽到这里收藏；点击查看待分类单词">
         <div class="collect-badge hidden" id="collectBadge">0</div>
         <div class="collect-zone-icon">📥</div>
-        <div class="collect-zone-text">拖拽<br>到这里<br>收藏</div>
+        <div class="collect-zone-text">拖拽到这里收藏<br><span class="collect-zone-sub">点击查看待分类 →</span></div>
     </div>
 
     <!-- 分类整理面板 -->
@@ -2861,6 +3471,8 @@
         </div>
     </div>
 
-    <script src="app.js?v=20260816_2"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+    <script src="app.js?v=20261009_6"></script>
 </body>
 </html>

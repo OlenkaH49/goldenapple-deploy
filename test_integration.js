@@ -46,8 +46,14 @@ async function main() {
 
     // 3. 读取预置文章列表
     console.log('\n3️⃣  读取文章列表...');
-    const articles = await apiGet('/api/articles');
-    console.log('   共', articles.length, '篇文章，第一篇:', articles[0].title, '(题数:', articles[0].questionCount + ')');
+    // 2026-10-06：/api/articles 改为分页契约 { items, page, total, totalPages, hasMore }
+    const artRes = await apiGet('/api/articles?page=1&pageSize=5');
+    const articles = (artRes && artRes.items) || [];
+    console.log('   第', artRes.page, '/', artRes.totalPages, '页 | 共', artRes.total, '篇 | 本页',
+        articles.length, '篇 | 还有更多:', artRes.hasMore);
+    console.log('   第一篇:', articles[0] && articles[0].title,
+        '(题数:', (articles[0] && articles[0].questionCount) + ')',
+        '| 含译文:', articles[0] && articles[0].hasSentences);
 
     // 4. 收藏单词（模拟拖拽收藏）
     console.log('\n4️⃣  拖拽收藏 vacation...');

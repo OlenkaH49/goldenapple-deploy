@@ -1,0 +1,868 @@
+# 项目长期记忆 — 金苹果之旅（初中背单词）
+
+## 技术栈与架构约定
+- 后端：Express + better-sqlite3（`data/app.db`），零外部依赖（无 Redis / PG，虽然 .env 里残留 PG/REDIS 变量但不使用）。
+- 分层：`db.js`（数据访问，全部导出为纯函数）→ `coze.js`（AI/知识库调用，纯函数，不碰 HTTP 响应）→ `queue.js`（进程内异步队列）→ `server.js`（路由）。
+- 新增能力优先写进 `coze.js` 的纯函数并导出，`server.js` 只做参数解析与响应拼装；前端在 `app.js`（单文件，函数风格，无框架）。
+- 日志风格：`console.log('🔎 [模块] ...')`，中文 + emoji 前缀，重启后靠日志排查。
+
+## 语料/缓存三层结构
+- `word_cache`：通用词库（word → definition），不区分语境。
+- `word_context`：语境库（word + context 唯一），RAG 核心；`definition` 允许为空占位，后续由 `word_meaning_generator` 补全。
+- Coze 知识库：`word_context` 的云端副本，供第一层检索。
+
+## 词典层（2026-10-05 新增）：本地 ECDICT，与「语境释义」正交
+- 数据：ECDICT（skywind3000，MIT/CC-BY-SA），过滤口径「纯字母 ≥2 字符 + 有中文释义」→ **365,058 条**。
+  独立文件 **`data/dictionary.db`**，运行期 **`readonly: true`**，与 `app.db` 分离（只读参考数据集，不抢写锁）。
+- 导入：`npm run dict:import`（`import_ecdict.js`，4.8s / 74,578 条/秒）。
+  下载**唯一可用通道 `gh-proxy.com`**（10 MB/s；raw.githubusercontent 超时、jsDelivr 20MB 上限 403、
+  `ecdict.mini.csv` 是 4KB 空壳、media.githubusercontent 404）。
+- **ECDICT 义项分隔符是字面量 `\n`（hex `5c 6e`，反斜杠+n 两个字符）不是真换行** → `split(/\\n|\r?\n/)`。
+  CSV 解析必须带**引号状态机**（`translation` 含内嵌换行）。音标是老式 ASCII（`'betә`→`ˈbetə`，英式）。
+- **ECDICT 里 0 条含撇号的词条** → `don't / isn't / o'clock` 这些初中高频词本来全查不到。
+  `getDictionaryEntry` 兜底链：直查 → 弯引号归一 → **缩写表 `CONTRACTIONS`（约 35 条，`don't` 展开成 `＝ do not` + `do` 的释义）**
+  → 所有格剥离 → 去撇号 → 连字符首段。返回多挂 `via` / `contraction` / `query`。
+- 口径：查词 = **词典层（同步、21µs）→ L2 语境库（本地）→ 联网层（默认关闭）**；
+  `?ai=1` 才开联网。卡片两栏：**「当前语境释义」在上、「其他释义」（词典全义项）在下**。
+- 「联网深查」按钮**按来源**给：文章释义 / 通用释义 / 什么都没有 → 给；本句释义 / kb / ai → 不给。
+- 真实覆盖率（72 篇已发布文章、剔除一篇把 PDF 原文当正文的脏数据）：**98.3%**，逐篇平均 **99.0%**；
+  剩余未收录全是人名地名与文本粘连伪词。
+
+## Coze 知识库接入（2026-09-27 新增）
+- 环境变量：`COZE_KB_ID` / `COZE_KB_API_KEY` / `COZE_KB_BASE_URL`（默认 `https://api.coze.cn`）；可选 `COZE_KB_TIMEOUT_MS`、`COZE_KB_MAX_RETRIES`、`COZE_KB_FILE_TYPE`。
+- 请求头必须带 `Agw-Js-Conv: str`（防大整数 ID 精度丢失）。
+- **L1 检索 = 调 Coze 工作流（2026-09-28 起）**，见下方专节；旧的直连检索路径已废弃。
+- **坑**：Coze 本地文件只支持 pdf/txt/doc/docx，**不支持 csv** → CSV 文本以 `file_type: txt` 上传；`chunk_strategy` 用 `separator: "\n"` + `max_tokens: 200`，让一行一条记录成为独立切片，检索结果可直接当 CSV 行解析。
+- CSV 单元格内的换行必须压成空格（`coze.csvEscape` 已处理），否则分段会错乱。
+- 三层查询：**L1 工作流** → L2 `word_context` → L3 AI 生成并回写 `word_context`（+ 补写 `word_cache` 兼容层）。命中层级在响应 `layer` 字段：`kb` / `context` / `ai` / `cache` / `none`。
+- 前端 `app.js` 的 `sourceLabels` 只认 `context`(语境释义) / `ai`(AI 生成) / `none`，其他值显示「通用释义」；故 L1 命中刻意返回 `source: 'context'`。
+- 三层查询默认开启 AI（`enableAI !== false`），冷词 miss 会真实调用 LLM（约 7s）；需要低延迟可传 `?ai=0`。
+
+## L1 检索 = Coze 工作流 word_context_search（2026-09-28 定案）
+- **为什么不用直连**：`POST /open_api/knowledge/document/search` 在 api.coze.cn 上是**网关级 404**（该路径不存在，官方文档也没有这个接口），每点一次词白跑 70–115ms；且 `/open_api/knowledge/document/list` 返回 `code:4101` —— **PAT 对该知识库无权限**。
+- **改成调工作流后，4101 自动解决**（实测）：工作流在服务端**用自己的身份**访问知识库，调用侧不再需要「知识库 document.* 权限」，
+  只需要 PAT 上的 **`workflow.run` 权限点**。用假 `workflow_id` 真打一次 → `HTTP 200 / code 4200 "Workflow not found"`（195ms），
+  返回的是 4200 而非 4100/4101 ⇒ **鉴权与路径都对、权限也有**。
+- 配置：`COZE_KB_SEARCH_WORKFLOW_ID`（核心开关，不填则 L1 直接跳过、从 L2 开始）；可选 `COZE_KB_WORKFLOW_PATH`(默认 `/v1/workflow/run`)、
+  `COZE_KB_WORKFLOW_QUERY_PARAM`(默认 `query`，工作流开始节点的入参名)、`COZE_KB_WORKFLOW_TIMEOUT_MS`(默认 30000)、
+  `COZE_KB_WORKFLOW_BOT_ID`（含数据库/变量节点的工作流**必须**关联智能体才填）。
+- 调用形态：`POST {BASE}/v1/workflow/run`，body `{ workflow_id, parameters: { query: "单词 + 语境句子" } }`。
+- **`data` 字段是 JSON 序列化字符串**（`"{\"word\":...,\"definition\":...}"`），必须二次 `JSON.parse`；
+  官方明确「部分场景可能返回非 JSON 结构的字符串」→ 解析失败时保留 `dataRaw`，**绝不能把原文当命中**。
+- 输出形态三层兼容（`searchKnowledgeBaseOnce`）：① `{word,context,definition}`；② `{output:"<JSON>"}` / `outputList[].output`（走 `pickExactWordRecord`）；
+  ③ 纯文本 CSV 行（走 `deriveKbSlicesFromText()` → `parseDefinitionFromSlice`）。**三种都必须过「word 完全匹配」这关**，不许返回别的词的释义。
+- 实测真实返回结构（2026-09-29，已发布的工作流）：`data` 解析后为
+  `{"results":[{"documentId":"...","output":"{\"context\":...,\"definition\":...,\"word\":...}"}]}` —— `output` 又是一层 JSON 字符串，需二次 parse。
+- **官方限制**：非流式接口 **90 秒内无响应会被网关断开**；工作流必须**已发布**；单次请求 ≤ 20MB。
+- **4200 是「不存在 / 未发布」的合并码**，文案说 "not found" 也可能只是没发布 —— 别只看文案。
+- 错误码提示表在 `coze.js` 的 `KB_WORKFLOW_CODE_HINTS`（4000 入参错 / 4009 节点报错 / 4100 鉴权 / 4101 无权限 / 4200 不存在或未发布 / 6003 需付费版）。
+- **`callCozeWorkflow({...})` 的 `workflowId` 参数没有默认值兜底**（不从常量取）→ 忘传就直接返回
+  「未配置工作流 ID」。写排查脚本时踩过：4 组对比全失败却误判成「检索行为异常」。
+  **排查脚本务必先确认 `ok=true` 再分析结果**。
+
+### L1 query 形态（2026-09-29 实测定案 —— 命中率 20% → 80%）
+- **病根**：`word_context` 里**同一句 context 被该句所有词共享**，而工作流**恒返回 3 条**
+  （传 `top_k` / `limit` 入参**全部不生效**，是节点里写死的）→ 拿「词 + 整句」去查，
+  top-3 常被同句的「兄弟词」占满（查 `shock` 返回 `paradoxes / marseilles / immigrants`），目标词被挤出去。
+- **实测（20 词样本）**：`word + 空格 + context` = **4/20 (20%)**；`word` 单独 = **16/20 (80%)**；
+  `word,context` 逗号 = 5/20 (25%)；`word` ∪ `word,context` = **18/20 (90%)**（两者仅 3/20 重叠，**几乎完全互补**）。
+- **实现**：`searchKnowledgeBase`（**多轮包装**）→ 按 `buildKbQueryAttempts()` 依次调
+  **`searchKnowledgeBaseOnce`**（单轮，原实现改名，逻辑未动），任一轮筛出目标词即立即返回。
+  实测收益：**20% → 80%**，平均耗时 550ms → 647ms，平均调用 1.25 次（命中时仍是单次调用）。
+- 配置 `COZE_KB_QUERY_MODE` = `two_step`（**默认**，word 单独 → word,context）/ `word`（只一轮，最快）/
+  `legacy`（旧的「词+空格+句」单轮，仅作回退）。无 `opts.word` 或空 context 时自动退化为单轮。
+- **想让 L1 更强，最大杠杆是去工作流编辑器把 KB 节点的 top_k 调大**（调用侧传参无效）。
+- 已知残留：即便两轮，`former` / `latter` / `whereby` 这类词仍可能两轮都不中（约 10%）→ 由 L2/L3 兜住。
+- 统计：`getLookupStats().kbWorkflow` = `{lookups, calls, multiRoundHits, hits, misses, errors, skipped, hitRate, avgMs}`。
+  `lookups` 是 L1 检索次数（命中率分母），`calls` 是实际调用次数（多轮会 > lookups）。
+  注意区分：`layers.kb` 是「L1 最终命中并成为结果」，`kbWorkflow.hits` 是「工作流调用成功且筛出匹配记录」。
+
+## 知识库检索「精确筛选」（2026-09-27 追加，2026-09-28 仍适用）
+- 检索是「召回」，一次会带回多个不相关的词 → `searchKnowledgeBase` 结果处理里加硬筛选，只留 `word` 与查询词完全匹配的那一条。
+- 调用方须传 `opts.word`（查询词）与 `opts.context`（用于同词多条时择优）；**不传时退回 query 的第一个词**。
+- 返回值：`exact`（筛选取用的那一条，含 definition/partOfSpeech/context/score）+ `hits`（只剩匹配那条；无匹配则 `[]`）+ `hitsAll`（原始召回，排查用）。
+- 匹配规则：忽略首尾引号/空白 + 大小写；「有 word 无 definition」视为未命中。
+- L1 命中时 `matchType = 'exact-word'`。
+
+## 知识库同步 = 手动模式（2026-09-28 起，自动同步已停用）
+- 手动三步：`node export_csv.js` → Coze 控制台手动上传 `word_context.csv`（文件类型选 txt）→ `node sync_to_knowledge.js --mark-synced`。
+- `sync_to_knowledge.js` 现在只做不联网的本地辅助 + 只读对账：默认打印流程指引；`--export` 导 CSV；`--stats` 本地统计；
+  `--mark-synced`（旧名 `--seed-markers`）标记已同步；`--verify [N]` 抽样真实检索对账（唯一会联网的命令）。
+  遗留选项 `--daemon/--full/--dry-run/--force/--no-now/--probe/--prune` 会打印「已停用」提示后退出。
+- `package.json` 脚本：`export` / `kb:guide` / `kb:export` / `kb:stats` / `kb:mark-synced` / `kb:verify`；`sync` = 打印手动流程。
+- **已同步标记的语义**：`word_context.kb_synced_at` + `kb_synced_definition`（内容快照）。判据
+  `kb_synced_at IS NULL OR kb_synced_definition <> definition` —— 内容级，不是时间级（`created_at` 不随 UPDATE 变；
+  `updated_at` 秒级精度严格 `>` 会漏同秒并列行）。所以「释义被 AI 补全/修改」会自动重新变成待同步。
+- CSV 固定 **4 列** `word,context,definition,part_of_speech`；UTF-8 **禁止 BOM**（`\uFEFF` 会让知识库把首列读成 `\uFEFFword` 而匹配不上）；
+  单元格内换行压成空格（`csvEscape` 已处理）。
+- 判定「三层是否正常」看响应 `layer` 字段：`kb`(L1) / `context`(L2) / `ai`(L3) / `cache`(通用词库兜底) / `none`。
+- ⛔ **已停用但仍保留为注释的代码**（恢复时需成对还原）：`coze.js` 的 `normalizeUploadPayload` / `uploadToKnowledgeBase` /
+  `uploadViaOpenApi` / `uploadViaV1` / `encodeKbContent` / `looksLikeBase64Literal` / `probeContentMode` /
+  `deleteKnowledgeDocuments` / `pruneAutoKnowledgeDocuments`（及 `module.exports` 里对应键，**漏注释会 ReferenceError**）；
+  `sync_to_knowledge.js` 里的 cron/runSync/攒批/硬超时/位点保护整块。
+- 历史经验（停用但仍有参考价值）：Coze 文本知识库**最多 300 个文件**、分段总数 10000、单 txt ≤ 5 MB —— 手动上传也别把整库拆成几百个文件；
+  v1 接口 `content` 的编码（明文 vs base64）官方无说明，当年用「探测状态机」解决，固定标记词会自毒（须每轮唯一）。
+
+## 性能约定：点词响应不吃数据库开销（2026-09-28 确立）
+- **索引**：`word_context` 的 L2 热路径是 `WHERE word = ? AND context = ? ORDER BY id DESC LIMIT 1` →
+  必须有**复合索引** `idx_word_context_word_context(word, context)`（建在 `initDB` 的建表块里，`IF NOT EXISTS` 对存量库自动补建）。
+  只有单列 `word` 索引时，会先把该词**全部**语境捞回来再逐行比 context（高频词上百条），等于每次点击白扫上百行。实测约 **3.5×** 差距。
+  因 `id` 即 rowid，复合索引天然有序 → `ORDER BY id DESC LIMIT 1` 不需要 TEMP B-TREE。
+- **回写一律异步**：better-sqlite3 是同步 API，写在请求链路里会阻塞整个事件循环；且 `server.js` 与同步脚本共用一个库文件，
+  另一边持写锁时要干等到 `busy_timeout`（5s）。所以「AI 生成后回写 `word_context` / `word_cache`」这类**副作用**，
+  统一用 `coze.scheduleWriteBack(label, fn)`（`setImmediate` + `try/catch`）排到本轮事件循环之后，先把响应发出去。
+  实测：响应返回 → 首次回写间隔 0.25ms；代价是毫秒级窗口内重复点同一「词+语境」会再走一次 L3。
+  搬进闭包前务必把 `definition` / `part_of_speech` **快照成局部常量**，否则会被后续兜底逻辑改写。
+- 例外：用户主动保存释义的 `POST /api/words` **不要异步**（前端要靠结果弹「释义已保存」）。
+
+## L1 熔断 + 4028（2026-09-30）
+- **Coze 业务码 `4028` = 账户额度（免费额度/余额）耗尽**，响应是 **HTTP 200 + `{code:4028, data:''}`**。
+  不是 4200（未发布）也不是 4101（无权限）→ **先看 code，别猜「是不是没发布」**。代码侧无解，只能充值/等额度刷新。
+- **熔断**：`KB_FATAL_CODES = {4028,4100,4101,4200,4201,6003}` 属「重试、换 query 形态都无解」类。
+  `callCozeWorkflow` 失败且命中即 `openKbCircuit()`（`COZE_KB_CIRCUIT_COOLDOWN_MS`，默认 10 min），成功即 `closeKbCircuit()`；
+  `searchKnowledgeBase(Once)` 入口判 `isKbCircuitOpen()` 直接跳过。不做熔断的代价：two_step 每次点词白打 2 轮 + 刷两屏报错。
+- **计数别双端各加一次**：`kbCircuit` / `layerErrors` 只在 `lookupWordWithLayers` 明细分支累加，`searchKnowledgeBase` 早退分支**不要** `++`。
+- 暴露面：`getLookupStats().kbWorkflow.circuit`、`GET /health#kbCircuit`、`GET /api/kb/reset-circuit`。
+
+## 点词体验：即时出卡 + 后台精修（2026-09-30）
+- L1 挂了后每次点词必然落到 L3 LLM：实测 GLM `glm-5.3-flash` 单次 **≈4s**、偶发 12s+（含 99 reasoning tokens）——**是模型延迟不是 bug**。
+- 所以**绝不能「等 Promise resolve 才建词卡」**。`openWordCard` 契约：① 用 `currentArticle.words` 本地释义**同步**弹卡（`pending:true` → 「⏳ 正在查询语境释义…」）；
+  ② RAG 回来 `updateWordCardIfOpen()` 原地刷新；③ 词卡指纹 `currentWordCardKey = word+'\u0001'+sentence` 防旧请求覆盖新卡；
+  ④ RAG 无结果时保留本地释义、只摘 `.wc-pending`（不重绘）。
+- **L3 独立收紧超时**：`callLLM` 默认 `600s`+`2 次`是给批量分析的；点词用 `WORD_MEANING_TIMEOUT_MS`(20s)/`WORD_MEANING_MAX_RETRIES`(1)，
+  仅在 `generateWordMeaningsWithCoze` 覆盖。**改 `callLLM` 默认值前先想批量路径**。
+- 回写仍走 `scheduleWriteBack`（`setImmediate`），日志打「发生在响应之后 N ms」可自证没阻塞。
+
+## 句子悬停：幂等排期（2026-09-30）
+- 症状「从上一句移到下一句触发不了；必须移动两下再停下」= 两 bug 叠加：
+  ① 旧开头 `if (panel.classList.contains('visible')) return;` → **上一句浮层没消失时进入下一句，这一轮永不排期**；
+  ② 每次 `mousemove` 都 `clearTimeout + setTimeout` → **同句内任何抖动都重置 3 秒**。
+- 现行契约：`armSentenceHover(el)` **幂等**（`armedIdx===idx && timer` → 返回；`visibleIdx===idx && visible` → 返回）；
+  换句先 `clearTimeout` + `hideSentenceHoverPanel()` 再排期；`mouseover` **进入即排期**；到点前校验 `sentenceHoverEl === el` 才弹。
+- 坑：`onSentenceMouseOut` **不要无条件清 `sentenceHoverEl`**（`mouseout` 先于新句 `mouseover`，新句可能没有 `mousemove`，
+  清掉会让已排期的计时到点时被误判丢弃）；延迟抽成 `SENTENCE_HOVER_DELAY_MS`(3s)；
+  `showWordCard` 与浮层互斥，要调 `clearSentenceHoverTimer()`（它同时清 armedIdx）。
+
+## 题目未就绪 → 等待页 → 阅读页（2026-09-30）
+- 旧的「上传完立刻进阅读页」→ 右侧题目区空的，用户以为坏了。现在**题目就绪才进阅读页**。
+- `awaitingQuestionReady` 是唯一闸门；`enterReadingPage(reason)` 带守卫（不在等待页就忽略，防异步竞态误切）。
+- 复用 index.html 里本来就是死代码的 `#loadingPage`（标题/文案/进度条/降级按钮样式齐全，此前**无人调用**）。
+- `openAnalyzedArticle(data, { deferEnter: true })`：照常填 `currentArticle` + 渲染阅读页 DOM，但**不 showScreen**。
+- `pollArticleProgress` 放行条件：`questionsReady` / `completed` / `failed` / 30s 手动降级 / 120s 超时；进阅读页后补 `showDragGuideIfNeeded()`。
+
+## 点词契约：必须总是弹卡（2026-09-30 第二轮修正）
+- ⛔ **不要再给点词加「释义没就绪就 return」的门禁**。`handleWordSpanClick` 曾经写死
+  `if (!currentArticle || currentArticle.wordsReady === false) { toast('释义生成中'); return; }`，
+  而单词释义工作流失败/超时后 `wordsReady` **永远不会变 true** → 点词被永久拦掉、卡片永不出。
+  现在：删掉门禁，点词统一走 `openWordCard` 的即时出卡契约（见上一节），本地没释义就先显示「⏳ 正在查询语境释义…」。
+- 配套改动（**改任意一处都要一起想**）：
+  · `queue.js` 的 `wordPromise.catch` 必须用 `cacheMap` 兜底并置 `t.wordsReady = true`（否则前端永远拿不到兜底释义）；
+  · `showWordCard` 里 `pending` 只代表「卡片上还没释义」，`updateWordCardIfOpen(word, sentence, null, ...)` = RAG 无结果、只摘 `.wc-pending` 不重绘。
+- ⛔ **卡片内「🌐 本句翻译」按钮已于 2026-10-05 整体删除，不要加回来。**
+  用户判断：「『数 3 秒还没查到才显示按钮』逻辑不通 —— 释义没查到，用户看句子翻译没用」。
+  一并删掉：`WORD_CARD_SENTENCE_BTN_DELAY_MS` / `wordCardSentenceTimer` / `wordCardSentenceBtnKey`、
+  `showWordCard` 的 `sentenceTransHtml` 与三分支计时块、`findSentenceTranslation()` /
+  `revealSentenceTranslationInCard()` / `revealWordCardSentenceBtn()`。
+  **句子翻译只剩一条路径**：`armSentenceHover()` 悬停 3 秒 → `showSentenceHoverPanel()` 浮层（`SENTENCE_HOVER_DELAY_MS`）。
+  ⚠️ `buildSentenceList` / `sentenceMatches` / `normalizeSentence` 是悬停浮层在用的，**不能跟着删**。
+
+## 前端重绘必须复位悬停状态（2026-09-30 第二轮）
+- `renderArticleWithTranslations()` 重建 `#readContent.innerHTML` 后，**必须** `sentenceHoverEl = null; clearSentenceHoverTimer(); hideSentenceHoverPanel();`。
+  否则 `sentenceHoverEl` 指向已销毁的旧节点 → 已排期的 3 秒计时到点时 `sentenceHoverEl !== el` 成立 → **被丢弃不弹**，
+  表现就是「悬停没反应，必须再动一下鼠标」（这是「移动两下才触发」的残留形态）。
+- 该函数另加渲染日志（`sentenceList=N / 切出片段=M / 匹配成功=K / 生成 .article-sentence 节点=K`），
+  并对文本匹配失败的片段做**顺序对齐兜底**（后端 sentenceList 与正文同序），避免整篇译文静默失效。
+
+## 模型降级链：健康熔断 + 超时细分（2026-09-30 第二轮）
+- 症状：短文也「单词释义失败（DeepSeek 超时 60s）」，DB 里 `created_at→updated_at` **正好 2 分钟**
+  = `getArticleTimeoutMs` 的 GLM 60s + DeepSeek 60s 串行白等。单词任务响应体最大，最容易超时。
+- **`CHUNK_FALLBACK_CHARS=5000` 对短文无效**：1707 字的文章按 5000 拆还是 1 批，`if (chunks.length===1) throw` → 等于没救。
+- 现有机制（coze.js）：
+  · `runWithModelFallback` = GLM(主) → DeepSeek(降级)，**跳过无 Key 与冷却中的模型**；全部冷却时退回完整链路（不会永久不调用）；
+  · `noteModelSuccess/Failure` + `MODEL_HEALTH_FAIL_THRESHOLD`(2) / `MODEL_HEALTH_COOLDOWN_MS`(300s)；
+  · `isTimeoutLikeError(err)` 判定超时类 → 按 `CHUNK_TIMEOUT_RETRY_CHARS`(1200) 重拆；
+    **仍只有 1 批时 `forceSplitIntoChunks(article, 2)` 按句边界强制劈半**（短文也能拆，不打碎句子）。
+- 暴露面：`getModelHealth()`（含从未失败的模型，`/health.modelHealth`）、`resetModelHealth()`、`GET /api/model/reset-health`；
+  `__diag` 只读导出给回归测试用，**业务代码勿依赖**。
+
+## 前端回归测试（2026-09-30 新增）
+- **无浏览器**（`vm.runInContext(app.js源码 + 测试钩子)`）：`test_sentence_hover.js` 16 / `test_waiting_flow.js` 16 / `test_word_card.js` **42**（2026-10-05 重写，同日再删按钮后 37 → 42）。
+  桩 = 最小 DOM（元素 `classList`/`querySelector`/`getBoundingClientRect` 手写）+ **可控 setTimeout**（能推进/清点计时器）。
+  两个必备细节：`document.createElement('div')` 要模拟 `textContent → innerHTML` 转义（`escapeHtml` 依赖它，否则释义渲染成空串）；
+  元素 `querySelector` 返回的假节点要能 `.remove()` 并同步从 owner 的 `innerHTML` 摘掉对应片段（`wc-pending` 断言依赖它）。
+  **2026-10-05 关键修正**：假 `querySelector` 原本对任何选择器都返回元素 → **坏 HTML（标签没闭合 / class 拼错）也会判通过**。
+  现在改成**真的按 owner 的 `innerHTML` 解析 class**，没有该 class 就返回 `null`（与真实 DOM 一致）。
+  ~~注意 app.js 里有**两个** `escapeHtml` 定义（约 3475 / 4316 行），函数声明后者覆盖前者。~~
+  **2026-10-07 已清理**：`escapeHtml` 现在全文件**唯一定义**（`app.js` 词 span 渲染区那处，
+  非字符串安全版：`if (!str) return ''; ... String(str)`），文件尾部的重复声明已删。
+  以后写 `app.js` 前若怀疑有重复声明，`grep -c "^function <名>" app.js` 即可核对。
+- **真实浏览器**（playwright-core + 本机 Edge，`channel:'msedge'`，无需下载浏览器）：`test_browser_translation.js` 17 PASS；
+  `test_word_card_browser.js`（`npm run test:card:browser`）**79 PASS**（2026-10-06 追加问题一/二/三 +
+  【⑩-b】有真译文文章 → 浮层显示真中文译文 +【①-b】文章列表来自服务端分页，共 36 条断言）—— 覆盖打桩测不出来的部分：
+  两栏**文档序**（`compareDocumentPosition`）、真实 DOM 里节点是否真的存在、同步出卡零网络、
+  「本句翻译」按钮已删的负向守卫（`.wc-btn-sentence` / `.wc-st-box` 的 `count === 0`，含真等 3.6 秒那一段）、
+  **真实鼠标悬停 3.6 秒浮层必须出现**、**词卡与正文列零水平重叠**。
+  ⚠️ 写「元素不出现」的断言时**别用** `!b || getComputedStyle(b).display === 'none'` ——
+  元素被整体删掉后它反而恒真、永远测不出回归；要写成 `locator(...).count() === 0`。
+  技巧：① `addInitScript` 拦截 `window.fetch` 伪造后端轮询序列（不用等真实 AI）；
+  ② **必须过「访问密码」关，否则 `#accessPasswordOverlay`（`position:fixed;inset:0;z-index:10000`）会挡掉所有指针事件**，
+  测出来的「悬停/点击无效」全是假象。2026-10-06 又踩一次：**临时探针漏写了这一行预设**（本测试文件里有），
+  结果真实鼠标 `mouseover.target` 与 `document.elementFromPoint()` 全是 `DIV#accessPasswordOverlay`，
+  `closest('.article-sentence')` 恒 null、**而且静默无日志**，差点误判成「悬停没修好」。
+  正确开法：`ctx.addInitScript(() => localStorage.setItem('accessPassword','e2e'))`（写在 `newPage()` 之前）；
+  万一还是弹了，就 `goto` 后往 `#accessPasswordInput` 填任意值 → 点 `#accessPasswordSubmit`
+  （server 未配 `ACCESS_PASSWORD` 时一律通过）→ 再兜底 `overlay.remove()`。
+  **排悬停类问题的第一招就是打 `elementFromPoint` —— 它就是「谁在挡路」的判决书。**
+  ③ 素材直接取已完成文章的 `content+sentences+questions`；
+  ④ `page.route('**/api/words/**', 延迟)` 能把「后台还没回来」的窗口拉长，稳定复现 3 秒分支；
+  ⑤ 卡片有 `animation: fadeIn 0.2s`，**截图前必须等 `opacity` 归 1**，否则截图里卡片是半透明的（看着像 bug）。
+- **接口层**：`test_api_layers.js`（`npm run test:api`）**76 PASS**，真 HTTP 打 `/api/*`；
+  【⑪】13 条守分页契约（逐页翻完 = total 且无重复无遗漏、预置优先、越界夹取、`withContent` 开关、`status` 过滤）；
+  写法是**同进程 `require('./server')` + `fetch`**（不要用 `ACCESS_PASSWORD= PORT=xxxx node server.js` 后台起 —— 会被敏感保护拦）。
+  断言要对**环境降级**留口子：Coze 4028 / LLM 超时时联网层必然失败、由兼容层兜底，这时不该判 FAIL。
+- **模型侧**：`test_model_fallback.js`（本地假 LLM 服务）23 PASS；**队列侧**：`test_queue_word_fallback.js`（打桩 coze）8 PASS。
+- **改完 `app.js` 记得 bump `index.html` 里的 `app.js?v=...`**（缓存指纹），否则部署环境可能一直加载旧文件。
+
+## 词性显示：ECDICT 老式缩写必须归一（2026-10-06）
+- ECDICT 的 `translation` 文本**行首**用的是老式英汉词典缩写：`a.`=adjective / `ad.`=adverb / `int.`=interjection。
+  初中生看不懂 `a. 小的`，统一成 `adj.` / `adv.` / `interj.`。
+- 两处归一，缺一不可：
+  · `db.js` 的 **`normalizePosAbbr(line)`**（导出，单测用），插在 `parseDictionaryRow` 的 `splitLines` 之后 `.map(...)`；
+  · `coze.js` 的 **`normalizePosLabel(pos)`**（导出）—— ECDICT `pos` 字段是**机器格式** `adj:100/n:50`（带权重、`/` 分隔），
+    直接吐给前端会显示成 `(adj:100)`；AI 产出的 `part_of_speech` 还混用 `a`/`ad`/`形容词`，也要过这里。
+  · `app.js` 的 `prettyPosLabel(pos)` 是第三道前端兜底，`definitionsToText` 已改用它。
+- ⚠️ **归一的正则红线**：必须要求行首标记后**紧跟空格或行尾**。否则 `analysis 分析`（无句点）、`a`（单独一行）、
+  `vt.&vi. 使` 会被误伤。已知小瑕疵：单独一行 `a`（无空格无句点）会被改成 `adj.`，ECDICT 实际数据都是 `a. xxx` 形态，不影响。
+
+## 收藏释义断链：三层防护（2026-10-06）
+- **症状**：阅读页点词有释义，收藏后单词本一片「暂无释义」。实测 `user_words` 35 行里 **25 行**是**字面量** `'暂无释义'`。
+- **三个写入端都写死了**：拖拽 `onSpanPointerDown` → `words[word] || '暂无释义'`（只查文章词表）；
+  卡片收藏按钮 → `definitionsToText(definitions)`（点词瞬间后台未回，数组是空的）；
+  划选 `handleTextSelection` → 写死 `'暂无释义'`。
+- **契约**：新增 `app.js` **`bestMeaningForCollect(word, opts)`** = 本句语境释义 → `localMeaningOf` → `dictionaryOf().translationLines[0]`；
+  **拿不到时返回 `''`，绝不返回 `'暂无释义'`**（否则又被当成真释义写进库）。
+- **读取端兜底**：`/api/user-words` 对 `空 / '暂无释义'` 的行用 `coze.resolveLocalMeaning()` 现场补，
+  响应每条额外带 **`meaning`（前端直接渲染）/ `meaningSource`（`stored|dictionary|context|cache|null`）/ `dictionary`（音标+全义项）**，
+  `definition` 原样保留供排查。`coze.resolveLocalMeaning(word, context)` 是纯本地（不联网不写库）的三级取义，已导出。
+- **渲染端兜底**：`renderVocabBook` 的 `meaningHtmlOf()` = 快照 → `dictionaryOf` → 收集 `missingWords` → 末尾批量
+  `POST /api/dictionary/batch`（≤2000 词）补齐后重绘；占位文案「释义补全中…」，而非「暂无释义」。
+
+## 收藏释义优先级 + 语境匹配必须归一化（2026-10-08 请求五，已落地）
+- **用户指定优先级：① 本句语境释义 → ② 文章词表 → ③ 词典层首义**（原 `bestMeaningForCollect` 只有后者两层参与）。
+- **根因有两条，缺一不可**：① `getWordContext`（L2）要求 `word + context` **逐字符相等**，
+  正文 DOM 句子与写库句子常因空格/标点/站标 `[xxx]` 差异而 miss；② 拖拽时没有词卡 →
+  旧 `bestMeaningForCollect(word)` 不带 `contextDefinition` → 第①层永远空。⇒ part-time 收藏成词典兜底的 `part`。
+- **匹配必须归一化，且前后端同规则**：`coze.js squashContextKey()`（小写→去站标→去非字母→去空白）
+  ≡ 前端 `squashSentence()`。查询统一入口 `coze.findWordContextRow(word, ctx)`：精确优先 → 归一化兜底，
+  返回 `matchType:'exact'|'normalized'`；`lookupWordWithLayers` 与 `resolveLocalMeaning` 都走它（别写第二套）。
+  候选行来自 `db.getWordContextCandidates(word, 200)`（只取 definition 非空、带 LIMIT，热路径零影响）。
+- **收藏走 `app.js resolveCollectMeaning(word, sentence, opts)`（异步）**：拖拽落点与卡片收藏都改走它。
+  请求**不带 `?ai=1`** → 只查本地词典 + 语境库（~1–5ms），**不调 LLM、不烧额度**。
+  只有当卡片上已是**真·语境释义**时才「卡片直取、不发请求」。
+- **⚠️ 关键坑：后端 `contextDefinition` 非空 ≠ 本句语境释义。** 兼容层（通用词库 `word_cache`）在
+  L2/L1/L3 全 miss 时也会填 `contextDefinition`，但 `contextSource='cache'`，那是**通用释义**。
+  前端判据必须是白名单 `REAL_CONTEXT_SOURCES = ['context','kb','ai']`（`app.js isRealContextSource()`）；
+  `cache`/`article` 只能归第②层。`contextSource` 为 null/空时按旧行为放行（兼容老调用）。
+  → 见 `test_word_card_browser.js` **【⑱】**（造 part-time 文章 + word_context 行 + 故意让 word_cache 存「错误」释义，
+  断言第①层压过它，并真实点词→词卡→收藏→查库）。
+- 前端指纹已升至 **`app.js?v=20261008_3`**（改 app.js 必须同步升，否则浏览器缓存老逻辑）。
+
+## 收藏 →「待分类」→ 分类 状态机与入口（2026-10-08 恢复入口）
+- **状态机**：`user_words.status` = `pending`(待分类，新收藏默认) → `learning`(学习中) / `mastered`(已掌握) / `review`(需复习)。
+  改状态走 `app.js sortWordAction(id, status)`（本地乐观更新 + `apiPut /api/word-status/:id` 后台同步）。
+  中文标签 `getStatusLabel()`；单词本筛选 tab = `filterVocab('pending'|'learning'|'mastered'|'review')`。
+- **分类面板**：`showSortPanel(words, title)` → `renderSortPanelContent()` → ★ `sortWordAction()`。
+  面板按钮是「✓ 已掌握 / 📖 学习中 / ↻ 需复习」。
+- **入口清单（全部走 `openPendingFromReading()`）**：
+  ① 「我的收藏」头部 `#favsSortBtn`「📋 去分类 N」（**本文口径**）★ 阅读页里的**正式入口**；
+  ② 右侧收集区 `#collectZone` 点击（`onCollectZoneClick`，带 600ms `window.__lastCollectAt` 守卫防「刚拖完就弹面板」）；
+  ③ 总结页 `#summarySortBtn`「📋 去分类待学单词（N）」→ `openSortPanelForSession()`（**会话口径**）；
+  ④ 单词本「📋 去分类」→ `goSortFromWordbook()` → `openSortPanelForArticle()`（**该文章**）；
+  ⑤ 兜底 `openSortPanelAllPending()`（**全部**，单词本没有对应文章时）。
+  **⚠️ 2026-10-08 用户明确要求删掉阅读页 topbar 的「📋 待分类 N」**（`#pendingEntryBtn` 已从
+  `index.html` 连同 `.pending-entry-*` CSS 一起移除，`updateCollectBadge()` 也不再查询它）——
+  理由：顶部是文章标题区，不适合放入口。**别再加回去。**
+- **★ `app.js updateCollectBadge()` 是所有入口计数的唯一刷新点**，计数变化才打日志。
+  **任何改动 `status` 或收藏集合的地方都必须调它**，否则出现「已掌握了计数还挂着」
+  （`sortWordAction` 曾漏调，被测试 ⑲ 抓出）。
+- **★ 收藏统计的「口径」铁律（2026-10-08 用户报「去分类 40 但只收藏了几个词」后定案）**：
+  ```
+  阅读页四个显示  → 一律「当前文章」：collectBadge 红点 / favsSortBtn「去分类 N」 /
+                    progText「N/M words」/ readingFavsList「我的收藏」列表
+  结算页          → 「本次会话」：summaryCollectedCount、summarySortBtn「去分类待学单词（N）」
+  单词本 / 面板兜底 → 「全部」：仅 openSortPanelAllPending、goSortFromWordbook 无文章时
+  ```
+  统一入口（`app.js`，都在 `updateCollectBadge` 上方）：
+  `collectedRowsOfArticle(id)` → `collectedWordSetOfArticle(id)` → `pendingCountOfArticle(id)`
+  → `pendingCountAll()` → `sessionPendingWords()`。
+  ⇒ **新增任何「收藏数」显示前先问：它属于上面哪一栏？** 混口径 = 数字互相打架。
+- **⚠️ 已废弃**：全局字符串数组 `collectedWords`（`let collectedWords = []`）**不再被任何计数/渲染读取**，
+  只在 `doCollectWord` 里继续 push（兼容旧引用）。新代码**别再读它** —— 它跨文章累计、切文章清空，
+  正是「1/121 words 对不上」的元凶。
+- **分类面板的范围由「打开时」决定**：`sortPanelSessionOnly` > `sortPanelArticleId` > 全部，
+  统一读 `currentSortPanelPendingList()`（`restoreSortPanel` 与 `sortWordAction` 的分类后重渲染都用它）。
+  ⚠️ 旧代码这里是 `sortPanelArticleId || word.articleId`，在「全部」模式下会莫名收窄到某个词所在文章。
+- **`finishLearning()` 不再直接跳结算页**：本文有待分类 → `summaryAfterSort = true` + 开面板；面板关闭时
+  `closeSortPanel()` 读该标志续跳 `gotoSummary()`。⇒ 总结页不再顶掉「待分类」这一步。
+- ⚠️ **历史陷阱**：`finishReading()` 一度是**死代码**（只有定义、零调用）→ 用户体感「待分类功能没了」。
+  排查「XX 功能没了」类报障的**第一步永远是 `grep 函数名` 找调用点**，别先读 UI/算法。
+- ⚠️ 测试教训：`userData.collectedWords` 是**页面内存数组**，各测试节的 `finally` 只删 DB 行、不清它 →
+  跨节残留会污染后面的计数断言。写断言别写死跨节共享状态的数字，要跟页面真实值对齐。
+
+## 词卡遮挡正文 → 悬停静默失效（2026-10-06）
+- 词卡实际尺寸 `298×480px`。旧定位「先上后下」把它摆在**正文列正上方** → 事件目标变成自家 `.word-card`，
+  `closest('.article-sentence')` 返回 `null` → 悬停永不排期、**无日志无报错**（静默失效）。
+- `positionWordCard(card, x, y)`：优先塞进 `#readContent` **右侧空白栏**（判据 `vw - rc.right >= w + 24`），
+  次选左侧，都没有才回退「锚点上下」。`top` 用 `y - h/2` 居中并 clamp 在正文/视口内。
+  **1280 视口实测**：正文列 `48..812`、右侧空档 **468px**、卡片落 `left=824`；**1024 视口只剩 48px → 必然回退**。
+- ⚠️ 词卡有**尺寸暴涨陷阱**：点词瞬间 `offsetHeight≈456`，后台核对回来变 `≈480` → 旧实现只在 `appendChild` 那一刻算一次定位。
+  现在 `showWordCard` 挂 **`ResizeObserver`（存在 `card._posObserver`）**，尺寸一变就重定位，`hideWordCard` 里 `disconnect()`。
+- 三个句子悬停监听**从 `#readContent` 提到 `document`**（`mouseover`/`mousemove`/`mouseout`）：
+  这样才能在日志里说清「谁挡住了鼠标」，也不再要求「鼠标物理落在正文里」。配套：
+  `describeEl(el)` / `isOwnOverlay(el)` / `resolveSentenceEl(e, quiet)` / `sentenceUnderPoint(x, y)` / `hoverTimerState()`。
+- ⚠️ **`elementFromPoint` 与真实鼠标事件会给出不同答案**：前者按当前几何算，后者是浏览器真实派发。
+  排查这类「悬停不触发」**必须以真实鼠标事件（`page.mouse.move`）为准**，几何探测只能当辅助。
+
+## 文章列表：服务端分页 + 按需详情（2026-10-06 改造，破坏性契约）
+- **原来**：`ARTICLES` 是 `app.js` 顶部的硬编码字面量，前端从不调 `/api/articles`
+  → 用户上传的文章**刷新页面就没了**（库里有、界面里没有）。
+- **现在**：`GET /api/articles` 返回 `{ page, pageSize, total, totalPages, hasMore, items }`（原来是**裸数组**）；
+  `items` 只带 `title/description/content/source/createdAt/level/...`，**不含 `sentences`/`words`/`questions`**
+  （体积最大的三样，按需由 `GET /api/article/:id` 给）。
+  参数：`page` / `pageSize`(默认 10，上限 100) / `status`(默认 all) / `withContent`(默认 1，`=0` 时列表不带正文)。
+- **排序铁律**：`ORDER BY CASE WHEN source = 'preset' THEN 0 ELSE 1 END, created_at DESC, id DESC`
+  - 预置 6 篇 `created_at` 最早（2026-08-26），单纯 `DESC` 会把它们挤到最后一页 → `preset` 优先是必须的；
+  - **`id DESC` 是分页稳定性的必需品**：`created_at` 只到秒，同秒并列时只按时间排序会让 LIMIT/OFFSET 重复行/漏行。
+- **前端两层**：`renderArticle(id)` 同步渲染（零网络）；`openArticle(id)` 先渲染再按需拉详情，
+  回来后**只在用户还停在这一篇时**才重渲染（否则会覆盖用户已切走的页面）。
+  `loadArticlesPage(page)` 分页追加；选择器只画已加载页 + 「加载更多」。
+- **`BUILTIN_ARTICLES`**：原硬编码数组降级为**离线兜底**（服务端挂了也能用），
+  `let ARTICLES` 初值由它填充并打 `detailLoaded: true`（表示详情已在内存，不必再拉）。
+- **别弄丢内置教材词表**：服务端 `words` 来自 `word_cache` 提取，而预置文章的
+  `vacation`/`immediately`/`sandcastles`/`campfire` **都不在 `word_cache`** 里
+  → `loadArticleDetail` 用 `mergeBuiltinWords()` 做「**内置优先、服务端补充**」。
+- **易漏边界**：列表刷新会把当前正在读的文章换成 `detailLoaded=false` 的服务端版本
+  → `loadArticlesPage` 末尾必须检测到就**自动补拉详情**，否则用户要再点一次才有译文/释义/题目。
+- 上传分析完成后新文章直接 `detailLoaded = true` 并插到列表首位（数据都在内存，不必再拉）。
+- **数据现状（2026-10-06 去重后）**：`articles` 从 73 篇降到 **26 篇**（6 预置 + 20 上传）。分页断言用动态值，不受影响。
+
+## 文章去重清理：删重复 + 收藏迁移（2026-10-06 执行，`db.cleanupDuplicateArticles`）
+- 入口：`npm run cleanup:articles`（**默认演练**）→ `npm run cleanup:articles:apply`（真删，先自动备份）。
+  代码在 `cleanup_articles.js` + `db.js`。测试 `npm run test:cleanup` = `test_article_cleanup.js`（**36 PASS**）。
+- 规则：按标题分组 → 每组保留「最新且带译文」的一篇（全组无译文则保留最新）→
+  把被删文章上的 `user_words` **改挂**到保留文章 → 再删文章。实测 73→26、迁移 22 条（撞键合并 1 条）、
+  `word_context` 改挂 740 条、悬空引用 0、收藏 35→34。
+- **两条红线（写在函数里，别绕过）**：
+  1. `source='preset'` 的文章**永不删除** —— 前端 `BUILTIN_ARTICLES` 离线兜底直接引用 `article_001..006`。
+  2. 标题只做轻归一化（空白 / `’`↔`'` / 大小写），**绝不做前缀或模糊匹配**。
+     实测 `...Tragedy in Tess`（被截断）与 `...Tragedy in Tess of` 只差一个 `of`，模糊匹配会误删。
+- **坑 1：备份不能用 `fs.copyFileSync`**。库跑 WAL，实测 `app.db-wal` 3.5 MB 而主文件停在一周前
+  → 拷主文件 = 备份出「旧快照」。必须 `db.backup(dest)`（一致性快照 + 允许并发写）。复制测试靶库同理。
+- **坑 2：演练模式不要另写一套逻辑**。整轮包在 `SAVEPOINT article_dedup`，dryRun 时 `ROLLBACK TO` 而非
+  `RELEASE` —— 同一段代码，演练数字就是真实数字。
+- **坑 3：`user_words` 有 `UNIQUE(user_id, word, article_id, sentence)`**，迁移撞键要「合并」，
+  且**必须先 `DELETE` loser 再 `UPDATE` winner**。反序会在 winner 是「源行」时把它改挂到保留文章、
+  与尚未删除的孪生行撞唯一键。**真实数据没暴露这个 bug**（那次 winner 恰好是孪生行），是自造样本逼出来的。
+  合并取舍：进度深(`mastered>learning>review>pending`) > 释义实(非「暂无释义」) > 收藏早。
+- **`word_context.article_id` 没有外键**（只有 `user_words` 有）→ 删文章不会被拦，
+  但不改会留下悬空 id；所以一并改挂到保留文章。`PRAGMA foreign_keys=1` 是开着的。
+- 备份落在 `data/app.db.bak-*`（`data/` 已 gitignore，不会入库，但会累积，需要时手动清）。
+
+## 破坏性逻辑的测试必须自造样本（2026-10-06 教训）
+- 第一版 `test_article_cleanup.js` 断言「真库确实存在重复分组」。真库被清干净后它立刻失效。
+- **正确做法**：`db.js` 支持 `DATABASE_PATH` → 把 `data/app.db` 复制到临时靶库，
+  在副本里 INSERT 自己造的样本（重复组 / 预置优先组 / 只差后缀组 / 各种收藏冲突），再跑真实删除。
+  这样测试与「当前生产数据长什么样」彻底解耦。
+- **2026-10-07 追加教训**：自造样本还不够 —— **绝对数**断言同样会漂移。
+  `EXPECT_DELETED = 4` 在真实库多出一组同名文章（用户又传了一篇「用户上传文章」）后立刻变红，
+  而被测代码完全正确。**改成「靶库基线（先 dryRun 量一次真实重复数）+ 自造样本数」**，
+  断言只为自造样本负责，替真实数据背书 = 测试迟早变噪音。
+- **2026-10-08 追加（更严重，真丢了数据）**：测试里 `DELETE` 了**共享的真实字典表**。
+  写【⑱】时为了造「兼容层存错误释义」，直接 `DELETE FROM word_cache WHERE word='part-time'` ——
+  忘了 `word_cache` / `word_context` / `dictionary` 是**全局字典，不区分文章**，`part-time` 是真实词
+  （那条释义是当年「点词→联网深查→L3 回写」写的）。跑完才发现兼容层退化成 0 行。
+  - **判据**：动手删之前先问「这个 `id` / `word` 是不是**我这次造的**？」不是 → **不许裸删**。
+  - `articles` / `user_words` 用专属 `qa_<功能>_probe` id，随便删（本来就是自己造的）；
+    全局字典表一律 **先快照 → 再改 → `finally` 原样还原**（含 `is_academic` 等附属列），
+    并在 finally 里 `check()` 断言行数还原。
+  - 恢复依据：`coze.js` L3 回写 `if (!getWordFromCache(lower)) addWordDefinition(lower, aiDefinition, aiPos)`，
+    `aiPos = first.part_of_speech || null` ⇒ **每词最多 1 行**、pos 取 AI 那条。可从同批 `word_context` 行重建。
+
+## 浮层「暂无翻译」= 列表刷新冲掉详情 × 正文掉空格（2026-10-07 修，两层都要看）
+现象：后端日志「✅ 句子翻译成功（17 句）」，前端悬停浮层却「（暂无翻译）」。
+**两个根因叠加，只修一个仍会复现：**
+1. **文章列表刷新把已加载详情冲成空壳（主因）**：`loadArticlesPage` 首页重载 `ARTICLES.length = 0`
+   后用 `Object.assign({}, 旧, mapServerArticle(列表项))` 合并，而列表项是**轻量版**
+   （`sentences: []` / `words: {}` / `questions: []` / `detailLoaded: false`）→ 译文被原地清空；
+   而补拉守卫 `!articleDetailAsked[id]` 是**一次性开关**，用户点过这篇之后永远为 `true` → **永不补拉**。
+   → 修复：`mergeServerListItem()`（详情已加载则重字段原样保留）、
+   `shouldFetchArticleDetail()`（已加载/在拉/失败 5s 退避内 → 不拉）、
+   `loadArticleDetail` 失败时 `delete articleDetailAsked[id]`、`renderArticle` 末尾**自愈补拉**。
+2. **正文掉空格导致匹配失败（次因）**：PDF 抽取的正文是 `rapiddevelopment` / `ofordinary`，
+   而后端 sentenceList 空格正常 → 逐字不等，只能靠「顺序兜底」对齐（片段数与句数一变就错位：
+   实测 `upload_1790413176880` 33 句 vs 39 片段、`upload_1790329600818` 58 句 vs 21 片段）。
+   → 修复：`squashSentence()`（归一化后**再去掉所有空白**）并加入 `sentenceMatches` 的三级判定，
+   实测该文文本匹配命中 6/17 → **17/17**。
+- **另外三条同类修复**：① 悬停译文改为 `resolveSentenceAt(idx)` 在**显示那一刻**重取
+  （旧实现在排期时闭包旧值，3 秒后用到过期空译文）；② `sentenceMatches` 的「精确包含」加
+  长度比例护栏（短侧 ≥ 长侧 50%），否则 3 字母的 `the` 会匹配任意含 the 的长句；
+  ③ `mapServerArticle` 透出 `serverHasSentences`，用来区分「本来没译文」与「有译文但没加载到」
+  （后者文案是「⏳ 译文还在加载中」并当场补拉，而不是含糊的「（暂无翻译）」）。
+- 日志：匹配失败打 `describeMatchFailure()`（片段键 + 最接近 idx + 公共前缀长度 + 差异位置）；
+  译文为空打 `describeEmptyTranslation(idx)`（详情没加载 / 本来没译文 / 该条 translation 字段为空）。
+- **排查口诀**：先看 `currentArticle.detailLoaded` 与 `currentArticle.sentences.length`，
+  再看 `🎨 [句子渲染]` 那行（文本匹配 vs 顺序兜底各几次）—— 三者就能把两个根因分开。
+
+## 粘连词拆分：用本地词典做 DP 分词，不引库也不默认调 AI（2026-10-07）
+- 场景：正文词间空格丢失 → `rapiddevelopment`（rapid + development）、`thinkprivate`、`ofordinary`。
+- `coze.segmentGluedWord(word)`：先查合并词（收录就不拆）→ 收集所有长度 ≥2 的子串**一次 SQL 批量查词典**
+  → DP 取 `Σ(词长²)` 最大的「每段都在词典里」的切分 → 无合法切分就不拆（宁可不说，绝不乱拆）。
+  纯本地 1~20ms，**零联网零额度**。
+- **坑：ECDICT 的 `bnc` / `frq` 是排名（1 = 最常用），不是次数。**
+  直接当词频做 tie-break 会**反过来奖励生僻词** —— `themore` 被拆成 `them + ore`。
+  必须用 `Σ 1/排名`（见 `gluePartFrequency`）。
+- 护栏：`isTrustedGluePart`（段长 ≥4 可信；短段必须有词频/柯林斯/牛津信号，挡 ECDICT 的 `bc`/`aa` 噪声）
+  + 输入上限 30 字母（60 个 `a` 曾被拆成 12 个 `aaaaa`）。
+- AI 兜底 `splitGluedWordWithAI` **默认关**，只有前端按钮带 `?ai=1` 才走；AI 结果**每段仍回查词典**
+  且要求拼回等于原串（AI 只切位置，不编词）。
+- 接口 `GET /api/glue-word/:word`；前端在「词典 + 语境 + 通用词库全无释义」时触发，
+  卡片按「合并 → 分开 → 分开」三行渲染（`buildGlueSplitSectionHtml`），结果只重绘同一张卡。
+
+## 预置文章没有译文 → 该类文章 `.article-sentence` 为 0（2026-10-06；同日复核更正）
+- **先分清数据边界，别再以偏概全**：**去重前** 73 篇文章里 **37 篇有真译文**（全部是 `upload_*`，格式 `[{sentence, translation}]`，
+  最早 2026-09-16 起；翻译通道正常，`word_context` 2026-10-06 凌晨仍在写入），
+  36 篇无 = **6 篇预置 `article_001~006`** + 30 篇上传（26 篇 `completed` + 10 篇 `failed`）。
+  **「`.article-sentence` 为 0」只发生在没有 `sentences` 的那批（尤其预置文章）上。**
+  （去重后 26 篇里仍有 6 篇预置无译文 + 若干历史上传无译文，规律不变。）
+- `app.js` 顶部的 **`ARTICLES` 是硬编码字面量**（2026-10-06 已降级为 `BUILTIN_ARTICLES` 离线兜底），
+  预置文章只带 `article` 正文字段、**没有 `sentences` 数组**。
+  旧 `buildSentenceList()` 直接返回 `[]` → `renderArticleWithTranslations` 走 `sentences.length === 0` 分支
+  → 一个 `.article-sentence` 节点都不生成 → 悬停在这些文章上**永远不可能触发**，且完全静默。
+  **排查「悬停不触发」第一步永远是先数 `document.querySelectorAll('#readContent .article-sentence').length`。**
+- 现修复：`buildSentenceList()` 在 `sentences` 为空时，用**与正文渲染完全相同的切句规则**
+  （先 `text.split(/\n\n+/)`，每段再 `.match(/[^.!?]+[.!?]+/g) || [p]`）本地切句兜底，`translation` 留空；
+  并且 `renderArticleWithTranslations` 里「顺序对齐」兜底去掉了 `&& sentences[seqIdx].translation`。
+  效果：`article_001` 从 0 → 10 个 `.article-sentence`，悬停浮层真实弹出（译文位显示「（暂无翻译）」）。
+  该兜底**只在 `list.length === 0` 时生效，对有译文的文章零影响**（2026-10-06 实测 `upload_1789519640345`
+  6 句全部正常出中文译文：「似乎虚构作品并不涉及现实世界。」）。
+- ~~前端**从不调 `/api/articles` / `/api/article/:id`** → 用户上传的文章刷新页面后就看不到了~~
+  **这条已于 2026-10-06 修掉**：文章列表改从服务端分页加载、详情按需拉取（见上面「文章列表：服务端分页 + 按需详情」一节）。
+- 要给预置文章配真译文，直接重跑 article 分析工作流产出 `sentences` 落库即可（`queue.js:307`），**不必等充值——通道是通的**。
+
+## 句子翻译失败 = `status='partial'`，不再静默降级（2026-10-06 发现，**同日晚已修**）
+- 原病灶：`queue.js` 的 `sentences = sentenceFailed ? [] : ...` + `updateArticleQuestions` **无条件**写 `status='completed'`
+  → 「句子翻译 rejected、但 word/quiz 至少一个成功」时文章被标 `completed`、`sentences` 却是 `[]`，
+  前端只看到「分析完成」而没有译文（去重前 26 篇历史数据完全吻合这一形态）。
+- **`articles.status` 现在是五态**：`pending` / `processing` / `completed` / **`partial`** / `failed`。
+  `partial` = **单词释义 + 阅读理解题成功，只有句子翻译失败**（不是整篇失败）。
+  失败原因落在新列 **`articles.sentences_error`**（可空；成功时显式清 NULL），迁移见 `migrateArticleErrorSchema()`。
+- **为什么不用 `failed`**：前端 `failed` 会弹「AI 服务暂时不可用，已切换到基础模式」的**整篇降级**提示，
+  而 partial 的题目/释义都是真结果，只是译文缺失 —— 混在一起误导用户。
+- **`db.updateArticleQuestions(id, q, s, {status, sentencesError})`**：`opts` 可省，**默认仍 `completed`**（老调用方零改动）。
+- ⚠️ **`/api/article-status/:id` 必须显式处理 `partial`**：否则会落进最后的 pending/processing 分支 →
+  前端以为还在跑、一路轮询到 **5 分钟超时**、永远进不了阅读页（把一个静默降级换成更糟的「卡住」）。
+  该分支返回 `status:'partial'` + `partial:true` + `sentencesFailed:true` + `sentencesError`，接口另在
+  `/api/article/:id`（+`hasSentences`）、`/api/articles` 列表项透出 `sentencesError`。
+- 前端：`pollArticleProgress` 的 partial 分支与 completed 同路（回填 + 进阅读页），额外调
+  `syncSentenceFailedNotice()` 显示 `#sentenceFailNotice`（🔴 **与整篇降级的 `#fallbackNotice` 是两个独立节点**，
+  别合并）；`renderArticle` 每次切文章重判该提示条并收起上篇残留的 `#fallbackNotice`。
+  轮询期间 `queueStatus.sentencesFailed` 也会提前透出 → 题目先就绪进阅读页时提示条已就位，不出现「过一会儿才冒警告」的跳变。
+- 句子翻译失败**不触发自动重试**（只标 partial）：Coze 额度按用户决策不充值，整篇重跑白烧额度；
+  失败原因已落库、前端走本地切句兜底。**改由用户手动点「重试」触发**（见下节，2026-10-07 已实现）。
+- `server.js` 的旧同步路由 **`/api/analyze`**（约 509 行）里还有一处写死 `status:'completed'` 的 SSE 事件 ——
+  前端 `index.html`/`app.js` **完全不引用**该路由（已 grep 确认），属死代码，**未改**。
+
+## partial 文章「兜底 UI + 只重跑句子翻译」（2026-10-07 已实现）
+- 入口：阅读页 `#sentenceFailNotice` 里「⚠️ 句子翻译暂时不可用 [重试]」→ `POST /api/retry-sentences/:id`。
+- 🔴 **`db.updateArticleSentences(id, sentences, {status, sentencesError})` 是专用函数，不要复用 `updateArticleQuestions`** ——
+  后者 `SET questions = ?`，重试译文时题目没变，传 undefined 会把题目**清成 NULL**（点一次重试把题目弄丢）。
+  新函数只碰 `sentences / status / sentences_error / updated_at`。
+- 🔴 **重试期间 DB 的 status 一直是 `partial`**，只有拿到最终结果才一次性翻 `completed` 或写回新原因。
+  好处：进程中途崩掉文章仍是 partial（可再点），不会卡死在 `processing`。
+- `queue.js` 侧：`startSentenceRetry`（立即返回，202 语义）/ `retrySentences`（等待式，测试用）/ `isRetryingSentences`。
+  只调 `coze.analyzeSentencesWithCoze`，**绝不跑 word/quiz**（省额度 + 不拿可能更差的新结果覆盖已有好结果）。
+  并发幂等靠 `sentenceRetryMap`（articleId → promise）；`startSentenceRetry` 还会查 `taskMap` 拒绝「整篇分析中」的并发插队。
+  **`sentences.length === 0` 也算失败**（否则 status 说成功、界面没译文 = 又一次静默降级）。
+  失败落库时用 `prevSentences` 而不是硬写 `[]`，避免误删已有数据。
+- `POST /api/retry-sentences/:id` 分支：404 不存在 / 200 `alreadyDone`（已 completed 且有译文 → **不调 Coze**）/ 409（pending|processing）/ **202 正常**。
+  做成 202 异步 + 轮询（而非同步等结果）是因为单次句子工作流可能几十秒，长 HTTP 易被掐断。
+- 🔴 **前端轮询必须同时看 `status` 和 `sentencesRetrying`**：重试中 status 一直是 partial，
+  只看 status 会把「还在跑」误判成「又失败」。三组合：`completed`+有译文 → 成功；`partial` 且 `sentencesRetrying=false` → 又失败；
+  `partial` 且 `true` → 继续等（2 分钟超时）。`sentencesRetrying` 由 `/api/article-status` 的 partial 分支透出；
+  completed 分支补 `sentencesRetrying: false`，前端可无条件读。
+- 前端按钮忙闲绑 `sentenceRetryTargetId`（文章 id）而不是全局布尔 → 重试途中切到别的 partial 文章，
+  新文章按钮不会被误置成「重试中…」。
+- 悬停浮层空译文文案分情况：partial → 「⚠️ 句子翻译暂时不可用，点正文上方的「重试」可重新生成」；
+  其它（预置文章本来就无译文）→ 保持「（暂无翻译）」。
+- 测试：`test_sentence_retry.js`（62 PASS，打桩 coze + 临时副本库，覆盖 db 契约/成功/失败/0 句/并发幂等/HTTP 全分支/静态接线）；
+  `test_word_card_browser.js` 新增【⑫】真浏览器段（79 → 98 PASS，验「提示条真可见、按钮真能点、点完真收起、题目不丢、库里真翻 completed」）。
+  指纹 `app.js?v=20261007_1`。
+
+
+## user_words 占位释义回填（2026-10-06 执行，`db.backfillUserWordDefinitions`）
+- 优先级（用户拍板）：**① dictionary → ② word_context → ③ 都没有写空串**（明确「不写『暂无释义』」）。
+  与 `coze.resolveLocalMeaning` 的顺序**相反**（那个是语境优先），别把两者搞混。
+- 只动「非真释义」的行（`isRealUserWordDefinition` 判据：空串与已知占位文案都算没有）；
+  **已有真释义的行一律不碰**（防止覆盖 AI/用户写得更好的释义）。
+- 演练与真实执行走**同一段写入代码**（`SAVEPOINT user_word_backfill` + dryRun 时 `ROLLBACK TO`），
+  所以演练数字 = 真实数字。CLI：`backfill_user_word_definitions.js`（默认演练，`--apply` 才写，写前 `db.backup()`）；
+  npm `backfill:userwords` / `backfill:userwords:apply`。
+- **真库结果**：24 条字面量「暂无释义」→ 全部由**词典层**补真释义（语境库命中 0，因为词典优先命中就不再问语境库），占位归零、收藏行数不变。
+  备份 `data/app.db.bak-2026-10-06T11-08-53-311Z`。
+- ⚠️ **空串 `''` 是终态但仍算 candidate**：它是「两层都查不到」的合法结果，却也是 `isRealUserWordDefinition` 眼中的「非真释义」
+  → 下次运行**仍会被扫到**。所以**幂等只能断言 `changed === 0`（值没变就跳过写入），不能断言 `candidates === 0`**；
+  report 用 `alreadyEmpty` 把「本来就是空」和「这次写空」分开报。
+- 词典查询在**另一条只读连接**上做（`getDictDb()`），放在 SAVEPOINT **之外**，不占 app.db 的写锁时间。
+
+## 打桩测试：不联网验证「部分失败」链路（2026-10-06）
+- `queue.js` 是 `const coze = require('./coze')` —— **模块对象**，函数属性可被测试进程覆写：
+  `coze.analyzeSentencesWithCoze = async () => { throw new Error('QA: ...') }`，
+  再让 word/quiz 正常返回，然后直接 `await queue.processArticle({...})` → 端到端跑通「句子挂 → 落 partial」，
+  **不需要 Coze 额度、不需要网络**。反向用例（三个全 reject）验证仍抛 `err.fatal === true`，
+  防止 partial 逻辑把整篇失败吞掉。`test_backfill_and_partial.js` 用这个套路（57 PASS）。
+- 新测试末尾带 8 条**静态接线自检**（读 `index.html`/`app.js`/`server.js` 用正则断言 DOM 节点、提示函数、
+  轮询 `status === 'partial'` 分支、`app.js?v=` 指纹已更新）—— 防「改了后端忘了接线」。
+- 跑 `test_word_card_browser.js` 需要 `NODE_PATH=C:/Users/Administrator/.workbuddy/binaries/node/workspace/node_modules`
+  （那里装了 `playwright-core`；不设的话会「跳过」而不是失败，容易误判成通过）。
+
+## 测试自污染：AI 回写是「词级」，固定样本词会被永久污染（2026-10-06）
+- `test_api_layers.js` 里 `findDictOnlyPair()` 原本用 12 个固定候选词找「词典有、word_cache/word_context 都没有」的样本。
+  跑过 `?ai=1` 后 AI 会把释义**回写进 `word_cache`**，而 `word_cache` **不区分语境**（词级）→ 12 个候选**全部**被写脏，此后每轮都选不中 → 连锁 3 条 FAIL。
+- 现改为**两级兜底**：① 先试固定候选；② 全脏时从 ECDICT 随机捞**生僻词**
+  （`collins=0 AND oxford=0 AND (tag IS NULL OR tag='')`，约 **25 万条**可选，AI 几乎不可能碰过）+ 排除 `word_cache`/`word_context` 已有的，取第一个干净的。
+  **不需要 `DELETE` 任何真实数据**。注意 `tag` 空值是 **NULL 不是 `''`**。
+- 同理，**别用固定语境当「新样本」**：语境要带 `RUN_TAG = QA-PROBE-${Date.now()}`，否则下一轮就变旧样本。
+- 三处断言连带关系：该采样失败会让 ⑤⑦ 整段跳过 → ⑧ 的 `dictionaryLayer.hits >= 3` 与 `kbWorkflow.disabled > 0` 一起 FAIL
+  （`kbDisabled` 只在 `!contextDefinition && !enableRemote` 时 `++`，而 ⑥ 走的是 L2 命中、不计）。**修采样后三条一起转绿。**
+
+## 前端：三条独立工作流必须各自判 ready（2026-09-28 修复）
+- 后端 `queue.js` 把 **句子翻译 / 单词释义 / quiz** 三个任务**并行**跑，各自一完成就写 `taskMap` 的
+  `sentences+sentencesReady` / `words+wordsReady` / `questions+questionsReady`。`/api/article-status` 原样返回这四个标记。
+- 前端 `pollArticleProgress` **必须逐个判**（`wordsReady`、`sentencesReady`、`questionsReady` 都不能漏）。
+  历史 bug：只判了 `wordsReady` → 「句子先翻译完、单词还在跑」时译文永远不渲染；
+  且正文里不会有 `.article-sentence` 元素 → 句子悬停浮层也一起失效。
+- `applyPartialProgress` 的合并规则：**未就绪的项传 `null`，原样保留，绝不用空值覆盖**；
+  并记住 `prevCount` / `prevLen`，**只有内容真变了才重绘**（`renderArticleWithTranslations` 会重建 `readContent.innerHTML`，
+  每 2 秒轮询白重绘一次会反复清掉用户的选区与悬停浮层，观感就是「卡」）。
+- 反向坑：别在 words 分支里顺手写 `sentences = part.sentences || []` —— 单词后到会把已渲染的句子冲成空数组。
+- 句子数据格式兼容在 `buildSentenceList()`（app.js 约 3167 行）：真实任务给 `{sentence, translation}`，mock 给 `{original, translation}`，
+  兼容表都覆盖了，**改后端句子字段前先看这张表**。
+
+## SQLite 并发 / 迁移坑（2026-09-27）
+- **`ALTER TABLE ADD COLUMN` 只接受常量默认值** → `DEFAULT (datetime('now'))` 报 `Cannot add a column with non-constant default`。改为加可空列 + 单独 UPDATE 回填。
+- `server.js` 与 `sync_to_knowledge.js` 同时开 `data/app.db` → 迁移用 check-then-act 会撞 `duplicate column name`，每列 `ALTER` 各自 try/catch 吞掉；`db.pragma('busy_timeout = 5000')`，写操作可用 `db.withBusyRetry(fn, tries=4)`（退避 100/200/400ms）。
+- **绝不能把 await 网络调用放进 better-sqlite3 事务**（`markWordContextSynced` 是纯同步单事务）。
+- `node-cron` 的 `executeTimeout` 只对 background/fork 生效，**inline 任务无超时** → 硬超时得自己用 `AbortController` + `setTimeout` 实现。
+- Windows 上 `child_process.spawnSync` 偶发 `EBUSY` → 长命令用异步 `spawn`。
+- 反面教材：用 `running` 布尔量防重入，一旦某次 run 卡死就永久 `true`、后续 tick 全被静默跳过 → 用 epoch + deadline + `finally` 复位替代。
+
+## 环境注意
+- Windows + Git Bash；`.env` 与 `data/` 已在 .gitignore 中；`word_context.csv` 未 ignore 但也未被 git 跟踪。
+- **`.env` 含敏感值（`ACCESS_PASSWORD`、Coze/LLM Key）→ 用 Read 整读会被「敏感内容保护」拦截并返回失败。不要重试、不要臆测内容。**
+  - 只读单行：`grep -n "KEY" .env | sed -E 's/=(.{0,10}).*/=\1…/'`（值遮蔽）。
+  - **要改 `.env` 就用一次性 Node 脚本「按锚点插入」**（不改已有键的值）：先 `copyFileSync` 备份到 `data/_env_backup_<ts>.txt`，
+    插入前断言锚点数量（如 `COZE_KB_BASE_URL=` 必须正好 2 处）、断言目标键尚不存在，
+    改完只打印结构性信息（键数变化、新增/丢失键、插入行本身），**绝不打印任何 `KEY=` 的值**；验证通过后删掉脚本与备份（备份含密钥）。
+- **`.env` 有重复键**：`COZE_KB_ID` / `COZE_KB_API_KEY` / `COZE_KB_BASE_URL` 各出现两次（约 27-29 行与 79-85 行）。
+  实测 dotenv **16.6.1 取【最后一次出现】**（用临时 env 文件验证过：`DUP_KEY=first` / `DUP_KEY=second` → `second`）。
+  ⚠️ 也就是说**改上面那组不生效**，已在那三行后加了警告注释指向下方那组。新增 KB 相关键请写进**下方那一组**。
+- `server.js` 的 `/api/*` 有访问密码鉴权：请求头 `x-access-password`，`ACCESS_PASSWORD` 未配置则不校验。本地验证接口用
+  `ACCESS_PASSWORD= PORT=3112 node server.js` 即可绕过（dotenv 不覆盖已存在的环境变量键，空串也算已存在）。
+- ⚠️ **别用「`... &` 后台起 server + 后面 kill」**：命令返回时子进程会被回收（表现为 curl 一直连不上），
+  且这种命令形态历史上被「敏感内容保护」拦过（`SENSITIVE_APPROVAL=TIMED_OUT`）。
+  **正确姿势（2026-09-30 验证可行）**：用 `run_in_background: true` 起 `ACCESS_PASSWORD= PORT=3999 node server.js`，
+  拿到 `task_id` 后用 TaskStop 收尾；或干脆「进程内直接 `require('./coze')` + 调函数」做验证（等价、更快、不占端口）。
+- ⚠️ **本机 curl 默认走代理**，访问 127.0.0.1 会报 `upstream connect failed: ... (os error 10061)` 并固定耗时 ~2s。
+  测本地接口必须加 `--noproxy '*'`（如 `curl -s --noproxy '*' -m 60 -G "http://127.0.0.1:3999/api/words/shock" --data-urlencode "context=..."`）。
+- `.env` 2026-09-30 新增（按锚点插在 `# API 域名` 之前，未改任何已有值）：
+  `COZE_KB_QUERY_MODE=two_step`、`COZE_KB_CIRCUIT_COOLDOWN_MS=600000`、
+  `COZE_WORD_MEANING_TIMEOUT_MS=20000`、`COZE_WORD_MEANING_MAX_RETRIES=1`。
+- **浏览器自动化环境（2026-09-30 打通，做前端交互排查很有用）**：
+  `npm i playwright-core --prefix C:/Users/Administrator/.workbuddy/binaries/node/workspace`（只装库，不下载浏览器），
+  用 `chromium.launch({ channel: 'msedge' })` 复用本机 Edge（`C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe`）。
+  跑脚本要 `NODE_PATH=<workspace>/node_modules`（否则 require 不到 playwright-core）。
+- 页面会请求 `/favicon.ico` 得到 404（项目没有 favicon）。Playwright 的 `page.on('response')` **抓不到它**，
+  只在 console 里出现一条 `Failed to load resource: 404` —— **不是接口问题，别被带偏**。
+- 项目根目录有 0 字节异常文件 `[esc(r.word)`（历史误操作），用户未确认是否删除。
+- `docker-compose.yml` 是 PG + Redis 迁移桩，当前架构不用，**不要动**。
+- **node-fetch v2**（`coze.js` 里 `const fetch = require('node-fetch')`，版本 2.7.0）：`timeout` 选项**有效**（数字，字符串会秒失败）；
+  `signal`（AbortController）也支持，abort 时抛 `AbortError`、消息含 `abort`，与网络超时（`network timeout at:`）要靠正则区分。
+
+## 释义锁 / 猜词模式（2026-10-07 新增，前端核心功能）
+- 理念：**先猜 → 对照 → 自行判断**，不强制、可跳过。
+- **★ 红线：锁只影响「显示」，不影响「加载」**。后端照常调 API（句子翻译 / 词释义）、
+  词典层 / L2 / L3 照常加载，数据在点词那一刻就在内存里；解锁是**纯本地重绘、0 网络 0 等待**。
+  改这里时守住：任何 `if (lock) return;` 提前跳过请求的写法都是错的。
+- 三个 localStorage 键：`guessMode`('on'|'off'，**默认 'off'=查看模式**，2026-10-08 改) / `unlockedWords` / `unlockedSentences`。
+  读写全包 `try/catch` —— 无痕模式下 `setItem` 会抛，**不能因为存不了偏好就让「点词」失效**。
+  数组（非 Set）保插入顺序才能「超上限丢最旧」；上限 800 条，句子 key 截断 300 字。
+- **★ 默认值契约（2026-10-08 用户要求「新文章默认查看模式，用户手动设置」）**：
+  `loadGuessLockState()` 的判据是 **`raw === 'on'` 才锁上**（旧代码是 `!== 'off'` 才锁上）。
+  ⇒ 缺省/null/脏值**一律当查看模式**；用户拨过开关就有显式值，之后开任何文章（含新上传）都沿用 ——
+  「全局 + 手动设置」不变，改的只是**没设置过时的默认**。改回去要问用户（他明确要「先看内容」）。
+- 判定：`isMeaningRevealed()` / `isSentenceRevealed()`（查看模式恒 true）。
+  句子 key 走 `sentenceLockKey()` = `normalizeSentence()` + 截断，吃掉「尾空格 / 全半角标点」差异。
+- 词卡三形态由 `__guessView` 决定：`'guess'`（只画猜测框）/ `'echo'`（刚提交，「你的猜测」+ 真释义并排，**不判对错**）/ `'full'`。
+  **必须显式指定、不能重新判定**：提交那刻词已进 `unlockedWords`，重判会变 `full`，把用户刚写的猜测抹掉。
+  `guess` 形态下连**音标 + 徽章**一起藏（「原形」「牛津3000」「柯林斯★」等于递答案），动作区（标记/收藏）整块不画（否则可绕过锁）。
+- **`currentWordCardData` 必须写回已判定的 `__guessView`**（`showWordCard` 尾部）：
+  不写回的话 `updateWordCardIfOpen` 的「猜词形态只更新内存、不重绘」判断恒为假 →
+  用户一点开就打字的输入框会被后台结果重建（丢焦点）。这是本轮修出的真 bug，别改回去。
+- **`loadGuessLockState()` 放在脚本载入时执行，不放 `DOMContentLoaded`**：① 默认模式在第一帧前定死，
+  不会先按默认画一遍再跳；② **无头测试不派发 `DOMContentLoaded`**，放进去状态永远载入不了（真踩过）。
+  只有依赖 DOM 的 `syncGuessLockButton()` 留在 DOMContentLoaded。
+  ⚠️ 副作用：**无头/浏览器测试里改了 `localStorage.guessMode` 再 `loadGuessLockState()`，顶部按钮文案不会自动跟**
+  （要手动调 `syncGuessLockButton()`）—— 断言按钮文案前记得补这一句。
+- 猜测草稿 `guessDraftByKey` / 已提交 `guessResultByKey` 放**模块级字典**、不塞进 `wordData`：
+  后台核对、拆词结果回来都会重绘卡片，模块级字典让任何重绘路径都能自然带上（不丢用户打了一半的字）。
+- 解锁**不可逆**（本会话内无「重新上锁」入口）：用户要求不强制、界面要简单。重置靠清 localStorage。
+
+## 译文状态：唯一判定处 articleTranslationState()（2026-10-08 定案）
+
+**过去这段判断散在 3 处**（悬停浮层占位文案 / 提示条显隐 / 重试入口），任何一处漏改就自相矛盾。
+现在收成 `app.js` 的 `articleTranslationState()`，返回 6 种取值：
+
+| 取值 | 条件 | 界面表现 |
+|---|---|---|
+| `ok` | `sentences.length > 0` | 正常 |
+| `failed` | `status==='partial'` 或 `sentencesError` | 提示条「句子翻译暂时不可用」+ 重试 |
+| `missing` ★ | `status==='completed'` + 0 句 + **detailLoaded 且非 preset** | 提示条「这篇还没有生成译文」+ 重试 |
+| `preset` | 预置文章、0 句 | 悬停保持「（暂无翻译）」，**不给重试** |
+| `analyzing`→`loading` ★ | `a.analyzing === true`（2026-10-08 加） | 「译文还在加载中」，**绝不说「还没生成」** |
+| `loading` | 0 句且 `!detailLoaded` | 「译文还在加载中」+ 补拉详情 |
+| `none` | `currentArticle` 为空 | — |
+
+- **判定顺序不能乱**：`failed` → `n>0 → ok` → **`analyzing → loading`** → `!detailLoaded → loading`
+  → `preset` → `missing`。`analyzing` 必须排在 `detailLoaded` 前，因为上传链路会（错误地）给出
+  `detailLoaded=true` 而字段仍是空壳。
+- **`analyzing` 标记的来龙去脉（2026-10-08）**：`openAnalyzedArticle` 传的是 `deferEnter`
+  （先停等待页），此刻三个 `*Ready` 都还是 false。原来无条件写 `detailLoaded = true`，
+  导致 ① 浮层落进 `missing` 谎报「这篇还没有生成译文」 ② `shouldFetchArticleDetail()` 恒 false、
+  自愈被永久挡住。现在：`allReady = wordsReady && sentencesReady && questionsReady`；
+  `detailLoaded = allReady`、`analyzing = !allReady`；文章落到终态时由 `clearAnalyzingFlag()` 清掉；
+  `loadArticleDetail` 也按 `d.status === 'processing' | 'pending'` 重新回填 `analyzing`（否则会把标记抹掉）。
+- ⚠️ 浮层文案**不再指路**「点正文上方的『重试』」（2026-10-08 用户要求）：
+  提示条不保证每篇都展开，文字指路会指向一个**看不见的按钮**（用户报的「没有重试按钮」就是这个）。
+  **文案要指就指自身**；重试入口由提示条本体承担。
+
+- **`missing` 是本轮新发现的真实数据类别**：早期「句子翻译失败」被静默写成
+  `completed` + `sentences=[]` + `sentences_error=null`，真库里实测有 **6 篇上传文章**这样
+  （正文 700~123316 字，译文 0 句）。旧前端把它和「预置文章本来就没译文」混为一谈 →
+  悬停只显示「（暂无翻译）」，**既无提示条也无重试入口**，用户只能反复反馈「还是不行」。
+- ⚠️ **`missing` 必须以 `detailLoaded` 为前提**：详情没到之前 `sentences` 恒为 `[]`，
+  不设这道闸会把每次「刚点开文章」都误报成「译文缺失」并弹出重试条。
+- ⚠️ `preset` 必须与 `missing` 分开：预置文章本来就不做句子翻译，给重试入口会白烧 Coze 额度。
+
+### 重试链路的三处前提（少任何一个 = 点了没反应）
+1. `/api/retry-sentences/:id` 的 `alreadyDone` 门槛是 `completed && sentences.length > 0` ——
+   对存量文章（completed + 0 句）天然不拦，会真的重跑。**别改成只认 partial。**
+2. **`/api/article-status/:id` 的 completed 分支必须返回真实的 `sentencesRetrying`**
+   （`queue.isRetryingSentences(id)`）。存量文章重试期间 DB 的 status 一直是 completed、
+   sentences 一直是 []，前端**只能**靠这个字段区分「还在跑」和「跑完还是空」。
+   曾经写死 `false` → 前端把「正在重试」误判成「非预期状态」直接 return，表现为「点了重试什么都不发生」。
+3. `pollSentenceRetry` 里 **`sentencesRetrying` 要先于 status 判定**：
+   在跑 → 继续等；`partial/completed 但译文为 0` 且不在跑 → 才算失败。
+
+## ★ 并行工作流的两类隐性丢数据（2026-10-08 定案，`pollArticleProgress` 重构）
+
+释义 / 译文 / 题目是**三个并行工作流**（`queue.js` 用 `Promise.allSettled`），完成顺序不确定。
+「后端日志成功、前端却没有」最后落在这两个坑上，**必须一起查**：
+
+### ① 轮询提前收工 → 迟到的结果没人接收
+- 旧代码在 `questionsReady` 那一刻 `return`。`quiz_generator` 常常最先完成 →
+  「题目就绪 → 进阅读页 → 轮询结束」，20 秒后句子翻译成功**没有任何人在听**。
+- 现场判据：真库 `status='completed'`、`sentences` 有 19 句（数据**完全正常**），
+  但前端 `currentArticle.sentences` 是空的 → 不是数据问题，是**结果没人接收**。
+  （实例：`upload_1791430247560`，正文 1534 字 / 19 句译文。）
+- 现在：进阅读页只代表「可以开始读了」。轮询转 **quiet 后台阶段**（`quietElapsed` 上限 15 分钟），
+  守到终态再回填；`maxWait`（5 分钟）超时也**不再 return**，转 quiet。
+- 终态回填收敛到**唯一入口** `applyTerminalStatus(articleId, status, quiet)`
+  （completed/partial/failed 一次回填释义+译文+题目 → 清 `analyzing` → partial 挂原因 →
+  在阅读页就原地重绘）。**不允许多处各写一份回填** —— 「两条路只有一条会回填」= 静默丢数据。
+- `applyPartialProgress(part, articleId)` 加了第二个参数：quiet 阶段可能**跨页面**，
+  必须写进**指定文章**的内存对象，且只有「正好是当前在看的」才允许重绘。
+- 兜底守护 `backfillArticleUntilTerminal(articleId, why)`：轮询被主动掐断时接手
+  （用户点「使用基础题目」/「取消分析」），**按文章独立 token**（`backfillTokens[id]`），
+  避免补 A 时把 B 的守护掐掉。
+
+### ② 对象引用分叉（`ARTICLES[i] = 新对象` 与 `currentArticle` 不同步）
+- `loadArticleDetail` 里 `ARTICLES[i] = full` 是**替换成新对象**，`currentArticle` 只是旧引用。
+  一旦中途拉过一次详情（上传中被悬停时 `showSentenceHoverPanel` 的「详情缺失就补拉」自愈就会触发），
+  分叉产生 → **回填写进新对象、渲染读旧对象** → 译文永远不显示。
+- 规则：**凡是 `ARTICLES[i] = <新对象>`，紧接着必须同步 `currentArticle`**；
+  回填函数里再加一道「同 id 不同对象 → 重新指向权威对象」的兜底，并 `console.warn` 出来（别静默修）。
+- 悬停自愈要加 `!currentArticle.analyzing` 守卫：生成中去拉详情只会拿到空壳，还会顺带制造分叉。
+
+## 「译文取不到」的排查套路（2026-10-08 沉淀，别再从匹配算法猜起）
+
+用户报「日志说句子翻译成功，但浮层显示暂无翻译」时，**按这个顺序证伪**，别一上来改匹配：
+1. **数据驱动跑一遍匹配逻辑**：临时脚本用 `vm.runInContext` 载入 `app.js`，导出
+   `sentenceMatches / normalizeSentence / squashSentence`，对真库每篇的
+   `content` 按 `p.match(/[^.!?]+[.!?]+/g)` 切片段后逐条匹配。
+   实测 148 片段命中 146 → **匹配逻辑没问题，立刻停止在这里改代码**。
+2. **对比后端与 DB**：`/api/article/:id` 的 `sentences` 与 `articles.sentences` 是否逐字节一致。
+3. **真浏览器逐篇悬停**（playwright + 本机 Edge），看是不是只有个别文章坏。
+4. **全库扫数据**：`WHERE status='completed' AND (sentences='[]' OR sentences IS NULL)` ——
+   本轮就是这一步找到根因。还要检查每篇里 `translation` 为空、`sentence` 为空、条目是裸字符串的项。
+- 运行时工具：`app.js` 暴露了 `window.__checkSentenceList([articleId])`，
+  一次打印「前端 buildSentenceList() vs 后端 /api/article/:id 的 sentences」，
+  并在「后端有译文而前端 0 句」时直接下结论「问题在加载链路、不是匹配」；
+  反向「后端也 0 句」时下结论「从未成功 + 应给重试入口」。
+- ⚠️ **第 4 步找到的坏数据，别一口咬定是「历史存量」就收手**（2026-10-08 被用户当场驳回的经验）：
+  那些文章**是用户自己上传的**、**题目生成成功**（同一批任务里别的产物都正常，只有译文缺）
+  → 这是**管线问题**，漏洞当时仍然活着，下次上传还会复现。判据用「同类数据是否还会再产生」，
+  **不要用 `created_at` 早晚当结论**（用户也记不清上传日期）。
+
+## ★「空成功」：比静默降级更隐蔽的一类 bug（2026-10-08 定案，已修）
+- **病根形态**：解析函数失败时 `return { 字段: [] }` 而不是 `throw` → 失败被**伪装成成功**。
+- **本项目实例**（`coze.js callSentenceBatch`）：JSON 解析失败只 `console.warn` 一句就返回空数组 →
+  `processSentenceBatches` 记「第 1/1 批 | 句数: 0 | **成功**」→ `✅ [句子翻译] 成功 | 句子: 0`
+  → queue 落 `status='completed' + sentences=[] + sentences_error=NULL`。
+  用户看到的就是「日志说成功、题目都在、整篇没译文，且连 partial 都不是 → 没有重试入口」。
+  触发条件：模型答非所问（含「额度不足」类提示语）、响应被截断（JSON 不闭合）、200 但响应体是错误对象。
+- **修法（两层都要，缺一层早晚回归）**：
+  ① 解析层 `callSentenceBatch`：解析失败 / 缺 `sentenceList` / 不是对象 / 空列表 → **抛错**（带原始响应前 200 字），
+     交给既有「模型降级链 GLM→DeepSeek」；
+  ② `processSentenceBatches` 汇总后断言「正文含英文却 0 句 → 抛错」；
+  ③ 落库层 `queue.js`：同样判据 → 强制 `partial` + 写 `sentences_error`。
+- **必须带白名单**：导出 `coze.hasEnoughEnglish(text)`（`[A-Za-z]` ≥ 20 个），queue 复用**同一判据** ——
+  用户粘贴**纯中文**时返回空是合法的，不能误标 partial。
+- 回归：`test_sentence_empty_guard.js`（`npm run test:empty`，20 项）= A 段真 coze + 假 LLM 断言全部抛错，
+  B 段打桩 coze + 真 queue 断言落 `partial`（且题目照常落库）。
+- 善后：`repair_missing_sentences.js` —— 批量补译文，**默认干跑**只列清单，`--yes` 才真跑（会消耗额度）。
+- **测试清理要连 `word_context` 一起删**：队列会写带 `article_id` 的 `word_context` 行，
+  只删 `articles` 会留悬空行 → `test_article_cleanup.js` 的「无悬空 article_id」断言报红（本轮真踩）。
+- 方法论已抽成独立 skill：`.workbuddy/skills/silent-empty-success-guard/`。
+
+### 第二处同类实例 + 连带损伤（2026-10-08 同日追加）
+- **同款病根**：`coze.js generateQuestionsWithCoze` 里 `JSON.parse(extractJSON(answer))` 失败只 warn →
+  `data=null` → `rawQuestions=[]` → **返回 0 题 + `success:true`**。
+  用户看到「quiz_generator 返回 0 题 → 无可用题目，使用降级题目」。
+  排查口诀：**在 `coze.js` 里搜 `JSON.parse(extractJSON(`，一次找齐所有同类风险点。**
+- **★ 一个「空成功」能连带毁掉一个毫不相关的功能**（本次最大教训）：
+  ```
+  quiz 0 题 → queue 落降级题（fallback.js 打 isFallback:true / answerMode:'selection'）
+    → 前端 applyQuizState 见到这些标记 → fallbackQuizActive = true（「降级划选答题模式」）
+    → onSpanPointerDown 开头写死 `if (fallbackQuizActive) return;`
+    ⇒ 正文单词拖拽收藏整个失效。用户报的是「拖拽坏了」，根子在题目生成。
+  ```
+  **用户报「A 功能坏了」时，先 grep A 的 early return / 前置 flag（`grep -n "if (.*Active) return"`），
+  不要顺着用户给的方向查** —— 他说 `dragstart` 没绑定（本项目拖拽走 **pointer events**）、
+  说「猜词模式覆盖了拖拽」也不成立，顺着查纯浪费时间。
+- **定位手法（很好用，已写进 skill）**：真浏览器里给目标函数包一层计数器
+  （`onSpanPointerDown`/`onSpanPointerMove`），结果 `pd:1, pm:0` ⇒ **入口被守卫提前 return 了**。
+  这比读代码猜快得多。
+- **quiz 间歇性失败的机制**：GLM 返回里 `reasoning_tokens` 占输出的一半
+  （实测 619/1187），触到输出上限时 JSON 被**截断** → 解析失败。`callLLM` 没设 `max_tokens`。
+  所以同一篇文章重跑可能就成功了 —— 别因为「重跑成功」就否掉这个 bug。
+- **修法**：抽 `runQuizOnce(cfg,...)` —— **完整打印原始返回**（前 4000 字 + 总长）、
+  解析失败/缺 `questions`/空数组/题干全空 → 全部抛错；
+  `generateQuestionsWithCoze` 改走既有 **`runWithModelFallback`（GLM→DeepSeek）**，
+  这才是「AI 没返回」的真兜底（旧代码 quiz 只用单模型、没有降级链）。
+  兼容：响应是纯数组时仍按题目列表接受。
+- 回归：`test_quiz_empty_guard.js`（`npm run test:quiz`，16 项）；
+  前端连带损伤由 `test_word_card_browser.js` 的**【⑰】**段做真鼠标回归。
+
+## 拖拽收藏（pointer events）实现要点（2026-10-08）
+- 走的是 **pointer events**（`pointerdown` 委托在 `#readContent` → `onSpanPointerDown/Move/Up`），
+  **没有 HTML5 `dragstart`**；`.word-span` 上有 `user-select:none` + `touch-action:none`。
+- 起点判定：>5px 才算拖拽（否则当点击）；落点用 `checkCollectZoneHover()`（**纯坐标判断**，
+  所以即使收集区被别的元素压住也照样命中）。
+- **普通模式**：越过 5px 立刻 `createSpanDragGhost()`（跟手）。
+  **降级划选模式**（`fallbackQuizActive=true`）：**延迟到指针进入收集区才建幽灵** ——
+  这样「正文划选作答」与「拖拽收藏」可以共存（旧实现是整块禁用拖拽）。
+- `wasDragging` 判据必须是 **`!!ghost`**，不能用 `moved`：降级模式下 `moved` 会变 true 但没有幽灵，
+  用 `moved` 会把「划选/点词」误判成拖拽并吃掉后续 click。
+- **已修的隐蔽 bug**：拖到收集区松手时 pointerdown/up 的 target 不同 → 浏览器把 click 派发到
+  `#readContent` **之外** → `spanJustDragged` 永远没机会被消费 → **下一次正常点词被吞掉**（不弹卡）。
+  修法：在 `onSpanPointerDown` 开头复位 `spanJustDragged = false`。
+- 全链路日志前缀统一 `🖱️ [拖拽]`；收集区缺失时会明确 warn「命中检测：未找到 #collectZone」。
+
+## 前端测试双轨约定 + 两个必踩的坑（2026-10-07 固化）
+- **双轨**：① `test_word_card.js` / `test_guess_lock.js` —— 无头 + 极简 DOM 打桩，验逻辑分支（快）；
+  ② `test_word_card_browser.js` —— 真 Edge + 真后端 + 真 DOM/CSS，验「打桩测不出来」的渲染与真点击。
+  新增前端功能两边都要加，别只加一边。截图产物 `test_screenshot_*.png` 是交付物的一部分。
+- **测试要播种 `guessMode`**：产品默认是猜词模式（锁上），任何测「查看模式」下完整释义卡的老测试
+  必须在 localStorage 里显式写 `guessMode:'off'`，否则会看到猜测框而不是释义。
+- **★ 打桩坑 1：必须播种 `accessPassword`**（如 `{ accessPassword: 'pwd' }`）。
+  否则 `request()` 停在 `ensureAccessPassword()`（等一个永不 resolve 的密码弹窗），
+  **后台请求永远不 resolve** → 表现为「请求发出去了但词典一直没到」，极易误判成业务 bug。
+- **★ 打桩坑 2：断言「请求已发出」要放在 `await flush()` 之后**（`flush = () => new Promise(r => setImmediate(r))`）。
+  `fetchWordDefinitions` 是 async，`openWordCard()` 同步返回时 `fetch` 还没真发出去。
+- 打桩的 `querySelector` 语义要照抄真实 DOM：**只有当 `innerHTML` 里真的出现该 class 才返回元素**，
+  否则卡片 HTML 拼错（class 少个字母）也会被判通过。
+- 无头测试里 `console.log` 会被替换成空函数做静音，**结果行要用 `log(...)`**（原 console.log）打印。
+- `test_integration.js` 需外部服务在 3000 端口（`/health`），是按需手动脚本、不在 `package.json` scripts 里。
+
+## 改代码的两个操作习惯（踩过坑）
+- **批量行注释后先清理 `^// // ` → `// `**：注释脚本给每行加 `// ` 前缀，本来已是 `// x` 的行会变成 `// // x`；
+  再用 Edit 做子串替换（`// ==== 标题 ====` 是 `// // ==== 标题 ====` 的子串）会补成三层前缀。
+- **停用/删除函数时，必须同步处理 `module.exports` 里的键**，否则 `require` 直接 ReferenceError。
+- 大段注释建议先写一次性脚本 + 锚点校验（行号 + 期望内容不符就中止），比手工 Edit 几十次更安全；跑完删脚本。
+
+## 做「命中率 / 性能」实测的方法约定（2026-09-29 踩坑总结）
+- **取样窗口必须固定**：`dbOps.getRecentWordContext(N)` 的 SQL 是「先 `ORDER BY id DESC LIMIT N` 再翻回升序」，
+  **N 变了开头元素就变**（越大起始越早）→ N=400 与 N=600 得到的是**完全不同的词样本**。
+  跨轮次对比不同写法/不同实现时，**必须固定 N**，否则会把「样本变了」误读成「策略变差了」。
+- **先确认 `ok=true` 再分析结果**：Coze 调用失败（忘传 `workflowId` / 401 / 超时）会返回空结果，
+  极易被误读成「检索返回固定结果」「该路径不通」。每次对比前先 assert 调用成功。
+- **多轮取样**：Coze KB 检索**不稳定**（同一 query 连打两次，一次命中一次空，实测词 `overcome`）→
+  单次结果不能当结论，至少 2 轮，样本 ≥ 20 词。
+- **用「命中率 + 耗时 + 调用次数」三个指标一起看**，只看命中率会漏掉「多轮把延迟拉高」的代价。
+
+
+## 总结页「收藏的单词」= 一词一卡（2026-10-09 定案）
+
+- 容器 `#summaryCollectedList` 的 class 是 **`summary-word-grid`**（`display:grid;
+  repeat(auto-fill,minmax(190px,1fr))`），**不是** `word-list`（那个是 flex 横排，
+  只剩它一处历史用法，已不再被任何元素使用；改的人不要把两者叠加，同优先级靠顺序取胜太脆）。
+- 卡片结构 `renderSummary()` 生成：`.summary-word-card` > `.sw-head`(`.sw-word` + `.sw-idx` 序号) /
+  `.sw-meaning` / `.sw-note`。**单词 / 释义 / 尾部括注各占一行**，不再用字符串 `·` 拼接。
+- **`splitMeaningNote(meaning)`**（app.js 纯函数）拆出尾部括注 → `{main, note}`：
+  `^(.*\S)\s*[（(]([^（()）]*)[）)]\s*$`。**前面必须还有非空内容**，
+  否则「整条就是括号」（如 `（复数）`）会被吞空。纯展示拆分，**不改数据**。
+- 教训：`.word-tag` 这个类**从来没有 CSS 定义**（渲染函数在用它，样式表里没有），
+  加上容器是 flex → 所有词挤成一行。**「排版糊了」先 grep 类名有没有 CSS 定义，别先怀疑 CSS 写错。**
+
+## 界面文案原则（2026-10-08/09 连续两次同类报障）
+
+- **不要解释用户已经知道的事**：删「自己对照一下就好，不判对错」（10-08）、
+  删「猜不出来也没关系，点「直接看释义」跳过」（10-09）。
+- **不要指路到可能不存在的 UI 元素**：浮层说「点正文上方的『重试』」但提示条当时没显示（10-08）。
+  要指就指自身。
+
+## 首页「快捷操作」与练习屏（2026-10-09 新增）
+
+- 四个入口：My Wordbooks（`showVocabBook`，已有）· **Learn Vocabulary / Review Words /
+  Daily Challenge** → 都是 `startPractice('learn'|'review'|'challenge')`。
+  副标题由 **`renderQuickActions()`** 在每次 `renderMain()` 时刷新（`qaWordbooksSub` / `qaLearnSub` /
+  `qaReviewSub` / `qaChallengeSub`），任何改 status/收藏集合的地方回首页都会自动重算。
+- **三条流程共用一个 `#practicePage` 屏**，`practiceState = { mode, queue, idx, phase, ... }`，
+  `renderPractice()` 按 mode+phase 整块重绘。加第四种练习 = 加一个 mode + 一个队列函数 + 两个 phase 分支。
+- 队列口径：learn = `status='pending'`（空则退化「knowledge 最低的未掌握词」）；
+  review = `next_review_at <= now` ∪ `status='review'`（**无排期的已分类词视为到期**，否则老数据永远进不来）；
+  challenge = 随机 3 个有释义的词。
+- 状态回写**复用** `PUT /api/word-status/:id`，`next_review_at` 由后端 `computeNextReview` 按 status 重算
+  （review=+1d / learning=+3d / mastered=+7d）。**不要再写第二套间隔规则。**
+- ★ **奖励数据必须放在 `startApp()` 清理清单之外**：`startApp()` 会 `removeItem('gaUserData')`。
+  🍎 存 `gaApples`、「今天做过没」存 `gaChallengeDate`（独立键，才能跨会话保留 + 真·每天一次）。
+  以后加任何「累计型/限次型」奖励都照此办理。
+- `:root` 已补 `--correct: #4CAF50`（此前多处用它但从未定义）。
+
+## 会话保持 + 浏览器历史（2026-10-09 新增）
+
+- **`localStorage.gaSession`** = `{ started, screen, articleId, at }`。
+  `showScreen()` 是**唯一**的切屏入口，它顺带：①写会话 ②按需 push/replace 历史。
+  **不要绕过 showScreen 手动 `classList.add('active')`**（会让刷新恢复和返回键同时失效）。
+- **历史模型**：根条目（depth 0）+ 1 条**同屏副本** + 每次切屏 push（带 `gaDepth`）。
+  多了那条副本才能在「退到根屏」时接住返回键（最根条目上按返回不触发 popstate，拦不住）。
+  根屏守卫判据 = 「**当前已经在根屏**」，不是「depth 到头了」。
+- `pushedScreens[]` 与 depth 对齐；`delta = pushedScreens.length - idx - 1`（**下标 ≠ depth**）。
+  目标屏已在栈里（含根屏）→ `history.go(-delta)`，**不压新条目**。
+- 新增屏若要支持「刷新恢复」，在 `restoreScreenFromSession()` 里加一个分支；
+  **临时的屏（等待页/练习页/总结页）故意不恢复**，退回主界面（内存态数据已随刷新丢失）。
+- 刷新恢复**不走 `startApp()`** → 必须自己补 `restoreUserIdentity()`（否则 `x-username` 变默认用户）
+  和 `initBackendSync()`（否则不打卡、没收藏数据）。`restoreUserIdentity` **不恢复 collectedWords**、
+  且置 `migrated = true`（防止把服务端拉下来的数据又 POST 回 `/api/migrate`）。
+- 新增任何「返回」类按钮：直接调 `showScreen(目标屏)` 即可 —— `goBackToHistory` 会自动判断
+  该屏是否已在栈里并做真回退。**不要再 `history.pushState`，也不要自己算栈深。**

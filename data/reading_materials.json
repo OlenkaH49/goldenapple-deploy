@@ -1,0 +1,275 @@
+[
+  {
+    "id": "article_001",
+    "level": "middle",
+    "levelLabel": "初中",
+    "title": "A Trip to the Beach",
+    "description": "A wonderful summer vacation with family.",
+    "article": "Last summer, my family and I went on a trip to the beach. We drove for three hours to get there. When we arrived, the sun was shining brightly and the sky was a beautiful blue. My little sister immediately ran towards the water, while my dad set up our tent. I helped my mom unpack the picnic basket. We spent the whole day swimming, building sandcastles, and playing beach volleyball. In the evening, we had a barbecue on the beach. The food smelled amazing! As the sun set, we sat around the campfire and told stories. It was one of the best vacations I've ever had.",
+    "words": {
+      "vacation": "假期", "beach": "海滩", "drove": "驾驶", "arrived": "到达",
+      "shining": "照耀", "beautiful": "美丽的", "immediately": "立刻", "ran": "跑",
+      "towards": "朝向", "set up": "搭建", "tent": "帐篷", "unpack": "打开包裹",
+      "picnic": "野餐", "basket": "篮子", "swimming": "游泳", "sandcastles": "沙堡",
+      "volleyball": "排球", "evening": "傍晚", "barbecue": "烧烤", "campfire": "篝火",
+      "stories": "故事", "whole day": "一整天", "as the sun set": "当太阳落下时"
+    },
+    "questions": [
+      {
+        "type": "DETAIL",
+        "question": "How did the family get to the beach?",
+        "options": ["By plane", "By car", "By train", "By boat"],
+        "answer_index": 1
+      },
+      {
+        "type": "DETAIL",
+        "question": "What did the little sister do first?",
+        "options": ["Built a sandcastle", "Ran towards the water", "Helped unpack", "Played volleyball"],
+        "answer_index": 1
+      },
+      {
+        "type": "DETAIL",
+        "question": "What did they do in the evening?",
+        "options": ["Swam in the ocean", "Built more sandcastles", "Had a barbecue", "Went shopping"],
+        "answer_index": 2
+      },
+      {
+        "type": "INFERENCE",
+        "question": "How did the author feel about the trip?",
+        "options": ["It was boring", "It was one of the best vacations", "It was too short", "It was expensive"],
+        "answer_index": 1
+      }
+    ]
+  },
+  {
+    "id": "article_002",
+    "level": "middle",
+    "levelLabel": "初中",
+    "title": "The Power of Music",
+    "description": "Music's effects on mood and expression.",
+    "article": "Music is an important part of many people's lives. It can make us happy, sad, or excited. Different types of music have different effects on our mood. For example, fast music with a strong beat can make us feel energetic and want to dance. Slow, soft music can help us relax and reduce stress. Music is also a form of expression. Musicians write songs to share their feelings and experiences with others. Some people learn to play musical instruments like the piano, guitar, or violin. Others enjoy singing in choirs or bands. No matter how we enjoy music, it has the power to connect people from all over the world.",
+    "words": {
+      "power": "力量", "effects": "效果", "mood": "心情", "expression": "表达",
+      "excited": "兴奋的", "types": "类型", "fast": "快的", "strong": "强烈的",
+      "beat": "节拍", "energetic": "精力充沛的", "dance": "跳舞", "slow": "慢的",
+      "soft": "柔和的", "relax": "放松", "reduce": "减少", "stress": "压力",
+      "musicians": "音乐家", "songs": "歌曲", "share": "分享", "feelings": "感受",
+      "experiences": "经历", "instruments": "乐器", "piano": "钢琴", "guitar": "吉他",
+      "violin": "小提琴", "singing": "唱歌", "choirs": "合唱团", "bands": "乐队",
+      "connect": "连接", "all over the world": "全世界"
+    },
+    "questions": [
+      {
+        "type": "MAIN IDEA",
+        "question": "What can music do to our mood?",
+        "options": ["Only make us happy", "Only make us sad", "Have different effects", "Have no effect"],
+        "answer_index": 2
+      },
+      {
+        "type": "DETAIL",
+        "question": "What kind of music can help us relax?",
+        "options": ["Fast music with strong beat", "Slow, soft music", "Loud rock music", "Heavy metal music"],
+        "answer_index": 1
+      },
+      {
+        "type": "DETAIL",
+        "question": "Why do musicians write songs?",
+        "options": ["To make money", "To share feelings and experiences", "To become famous", "To practice their instruments"],
+        "answer_index": 1
+      },
+      {
+        "type": "MAIN IDEA",
+        "question": "What is the main idea of this passage?",
+        "options": ["Music is only for musicians", "Music has many forms and benefits", "Music is too loud", "Music is a waste of time"],
+        "answer_index": 1
+      }
+    ]
+  },
+  {
+    "id": "article_003",
+    "level": "middle",
+    "levelLabel": "初中",
+    "title": "Man's Best Friend",
+    "description": "The loyalty and companionship of dogs.",
+    "article": "Dogs are often called \"man's best friend\" and for good reason. They are loyal, friendly, and always ready to help. Dogs have been domesticated for thousands of years and have become an important part of many families. There are hundreds of different breeds of dogs, each with their own unique characteristics. Some dogs are small and good for apartment living, while others are large and need lots of space to run. Dogs can be trained to do many things, such as fetching balls, guarding homes, and even helping people with disabilities. Taking care of a dog is a big responsibility. They need food, water, exercise, and love every day. But the joy and companionship they bring make it all worth it.",
+    "words": {
+      "loyal": "忠诚的", "companionship": "陪伴", "domesticated": "驯养的", "breeds": "品种",
+      "unique": "独特的", "characteristics": "特征", "apartment": "公寓", "space": "空间",
+      "trained": "训练", "fetching": "取来", "guarding": "守卫", "disabilities": "残疾",
+      "responsibility": "责任", "food": "食物", "water": "水", "exercise": "锻炼",
+      "love": "爱", "joy": "快乐", "thousands of years": "数千年", "for good reason": "有充分的理由",
+      "take care of": "照顾", "make it worth it": "使一切值得"
+    },
+    "questions": [
+      {
+        "type": "DETAIL",
+        "question": "Why are dogs called 'man's best friend'?",
+        "options": ["They are expensive", "They are loyal and friendly", "They can bark loud", "They eat a lot"],
+        "answer_index": 1
+      },
+      {
+        "type": "DETAIL",
+        "question": "How many breeds of dogs are there?",
+        "options": ["Only a few", "Hundreds", "Exactly 100", "Thousands"],
+        "answer_index": 1
+      },
+      {
+        "type": "DETAIL",
+        "question": "What is one thing dogs can be trained to do?",
+        "options": ["Drive cars", "Cook food", "Guard homes", "Read books"],
+        "answer_index": 2
+      },
+      {
+        "type": "DETAIL",
+        "question": "What do dogs need every day?",
+        "options": ["Only food", "Food, water, exercise, and love", "Just sleep", "Expensive toys"],
+        "answer_index": 1
+      }
+    ]
+  },
+  {
+    "id": "article_004",
+    "level": "high",
+    "levelLabel": "高中",
+    "title": "The Concept of Time",
+    "description": "Philosophical and scientific perspectives on time.",
+    "article": "The concept of time has fascinated philosophers and scientists for centuries. In physics, time is considered a dimension, along with space, in which events occur in a non-reversible order. Einstein's theory of relativity revolutionized our understanding of time, showing that it is not absolute but depends on the observer's frame of reference. Time dilation, for example, means that time passes more slowly for objects moving at high speeds relative to stationary observers. This has been confirmed by experiments with atomic clocks on airplanes and satellites. In psychology, the perception of time varies depending on factors such as attention, emotion, and age. When we are engaged in an interesting activity, time seems to fly by, while when we are bored, it drags on. Understanding time is crucial not only for scientific progress but also for organizing our daily lives and making sense of our experiences.",
+    "words": {
+      "concept": "概念", "fascinated": "使着迷", "philosophers": "哲学家", "scientists": "科学家",
+      "centuries": "世纪", "physics": "物理学", "dimension": "维度", "events": "事件",
+      "non-reversible": "不可逆的", "order": "顺序", "Einstein": "爱因斯坦", "relativity": "相对论",
+      "revolutionized": "彻底改变", "absolute": "绝对的", "observer": "观察者", "frame of reference": "参考系",
+      "time dilation": "时间膨胀", "objects": "物体", "high speeds": "高速", "relative to": "相对于",
+      "stationary": "静止的", "confirmed": "证实", "atomic clocks": "原子钟", "airplanes": "飞机",
+      "satellites": "卫星", "psychology": "心理学", "perception": "感知", "factors": "因素",
+      "attention": "注意力", "emotion": "情绪", "engaged": "参与", "activity": "活动",
+      "fly by": "飞逝", "bored": "无聊的", "drags on": "拖延", "crucial": "关键的",
+      "scientific progress": "科学进步", "making sense of": "理解"
+    },
+    "questions": [
+      {
+        "type": "DETAIL",
+        "question": "What did Einstein's theory of relativity show about time?",
+        "options": ["Time is absolute", "Time depends on the observer's frame of reference", "Time only exists in space", "Time is the same for everyone"],
+        "answer_index": 1
+      },
+      {
+        "type": "DETAIL",
+        "question": "What is time dilation?",
+        "options": ["Time passing more slowly for moving objects", "Time stopping completely", "Time moving backwards", "Time speeding up for everyone"],
+        "answer_index": 0
+      },
+      {
+        "type": "DETAIL",
+        "question": "What affects our perception of time according to the passage?",
+        "options": ["Only age", "Attention, emotion, and age", "Weather conditions", "The time of day"],
+        "answer_index": 1
+      },
+      {
+        "type": "MAIN IDEA",
+        "question": "Why is understanding time important?",
+        "options": ["For scientific progress and organizing daily lives", "Only for scientists", "For making money", "For predicting the future"],
+        "answer_index": 0
+      }
+    ]
+  },
+  {
+    "id": "article_005",
+    "level": "high",
+    "levelLabel": "高中",
+    "title": "The Human Brain",
+    "description": "Exploring the complexity of the brain.",
+    "article": "The human brain is one of the most complex and fascinating organs in the body. It is composed of billions of neurons that communicate with each other through electrical and chemical signals. The brain can be divided into several regions, each responsible for different functions. The cerebrum, the largest part, controls conscious thought, memory, and voluntary movements. The cerebellum coordinates balance and motor skills. The brainstem regulates basic life functions like breathing and heartbeat. Recent advances in neuroscience have revealed that the brain has remarkable plasticity, meaning it can reorganize itself by forming new neural connections throughout life. This is particularly evident in cases of brain injury, where undamaged areas can sometimes take over functions of damaged regions. Understanding the brain's structure and function is essential for developing treatments for neurological disorders and unlocking the mysteries of consciousness.",
+    "words": {
+      "complex": "复杂的", "fascinating": "迷人的", "organs": "器官", "composed": "组成",
+      "billions": "数十亿", "neurons": "神经元", "communicate": "交流", "electrical": "电的",
+      "chemical": "化学的", "signals": "信号", "regions": "区域", "responsible": "负责的",
+      "functions": "功能", "cerebrum": "大脑", "conscious": "有意识的", "thought": "思考",
+      "memory": "记忆", "voluntary": "自愿的", "movements": "运动", "cerebellum": "小脑",
+      "coordinates": "协调", "balance": "平衡", "motor skills": "运动技能", "brainstem": "脑干",
+      "regulates": "调节", "basic": "基本的", "breathing": "呼吸", "heartbeat": "心跳",
+      "neuroscience": "神经科学", "revealed": "揭示", "remarkable": "显著的", "plasticity": "可塑性",
+      "reorganize": "重组", "neural connections": "神经连接", "throughout life": "一生",
+      "evident": "明显的", "brain injury": "脑损伤", "undamaged": "未受损的", "take over": "接管",
+      "damaged": "受损的", "structure": "结构", "essential": "必要的", "treatments": "治疗",
+      "neurological disorders": "神经系统疾病", "unlocking": "解开", "mysteries": "奥秘",
+      "consciousness": "意识"
+    },
+    "questions": [
+      {
+        "type": "DETAIL",
+        "question": "What is the brain composed of?",
+        "options": ["Billions of neurons", "Muscle fibers", "Blood vessels", "Bone cells"],
+        "answer_index": 0
+      },
+      {
+        "type": "DETAIL",
+        "question": "What does the cerebrum control?",
+        "options": ["Balance and motor skills", "Conscious thought and memory", "Breathing and heartbeat", "Digestion"],
+        "answer_index": 1
+      },
+      {
+        "type": "DETAIL",
+        "question": "What is brain plasticity?",
+        "options": ["The brain's ability to reorganize itself", "The brain's rigid structure", "The brain's size", "The brain's color"],
+        "answer_index": 0
+      },
+      {
+        "type": "MAIN IDEA",
+        "question": "Why is understanding the brain important?",
+        "options": ["For growing vegetables", "For developing treatments for neurological disorders", "For building computers", "For predicting weather"],
+        "answer_index": 1
+      }
+    ]
+  },
+  {
+    "id": "article_006",
+    "level": "high",
+    "levelLabel": "高中",
+    "title": "Globalization",
+    "description": "The interconnected world and its challenges.",
+    "article": "Globalization has transformed the world into an interconnected network of economies, cultures, and societies. Advances in technology, particularly the internet and transportation, have made it easier than ever for goods, services, and information to flow across borders. Multinational corporations operate in multiple countries, creating global supply chains that span continents. Cultural exchange has also increased, with people around the world having access to foreign music, movies, and cuisine. However, globalization is not without its challenges. It has led to economic inequality, as wealthy nations and corporations often benefit more than developing ones. There are also concerns about cultural homogenization, where local traditions and languages may be replaced by global influences. Environmental issues such as pollution and resource depletion have become global problems requiring international cooperation. As the world becomes more connected, finding a balance between global integration and local preservation remains a key challenge for policymakers and citizens alike.",
+    "words": {
+      "globalization": "全球化", "transformed": "转变", "interconnected": "相互连接的", "network": "网络",
+      "economies": "经济", "cultures": "文化", "societies": "社会", "advances": "进步",
+      "technology": "技术", "particularly": "尤其", "internet": "互联网", "transportation": "交通",
+      "goods": "商品", "services": "服务", "information": "信息", "flow": "流动",
+      "borders": "边界", "multinational": "跨国的", "corporations": "公司", "operate": "运作",
+      "global supply chains": "全球供应链", "span": "跨越", "continents": "大陆", "cultural exchange": "文化交流",
+      "increased": "增加", "access": "访问", "foreign": "外国的", "music": "音乐",
+      "movies": "电影", "cuisine": "美食", "challenges": "挑战", "economic inequality": "经济不平等",
+      "wealthy": "富裕的", "nations": "国家", "benefit": "受益", "developing": "发展中的",
+      "concerns": "担忧", "cultural homogenization": "文化同质化", "local traditions": "地方传统",
+      "languages": "语言", "replaced": "取代", "global influences": "全球影响", "environmental issues": "环境问题",
+      "pollution": "污染", "resource depletion": "资源枯竭", "international cooperation": "国际合作",
+      "balance": "平衡", "global integration": "全球一体化", "local preservation": "地方保护",
+      "policymakers": "政策制定者", "citizens": "公民", "alike": "同样地"
+    },
+    "questions": [
+      {
+        "type": "DETAIL",
+        "question": "What has made globalization possible?",
+        "options": ["Decline in technology", "Advances in technology like internet and transportation", "Isolation policies", "Natural disasters"],
+        "answer_index": 1
+      },
+      {
+        "type": "DETAIL",
+        "question": "What is one challenge of globalization mentioned?",
+        "options": ["Increased cultural diversity", "Economic inequality", "Decreased trade", "Less communication"],
+        "answer_index": 1
+      },
+      {
+        "type": "DETAIL",
+        "question": "What is cultural homogenization?",
+        "options": ["Preserving local traditions", "Replacing local traditions with global influences", "Increasing language diversity", "Protecting local cuisine"],
+        "answer_index": 1
+      },
+      {
+        "type": "MAIN IDEA",
+        "question": "What is a key challenge mentioned in the passage?",
+        "options": ["Finding balance between global integration and local preservation", "Stopping all international trade", "Eliminating all technology", "Closing borders completely"],
+        "answer_index": 0
+      }
+    ]
+  }
+]
